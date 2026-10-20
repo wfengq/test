@@ -12,8 +12,8 @@ from attention_budget.collectors.bilibili import BiliCollector, BiliLoginError
 from attention_budget.collectors.xhs import XhsCollector, XhsProcess
 from attention_budget.config import XhsCfg
 from attention_budget.models import SourceFailure
-from attention_budget.xhs_build import (GO_TOOLCHAIN_SHA256, build_xhs_mcp, ensure_go, patch_leakless,
-                                        xhs_exe_path)
+from attention_budget.xhs_build import (BUILD_ID, GO_TOOLCHAIN_SHA256, build_xhs_mcp, ensure_go,
+                                        patch_headless_browser, xhs_exe_path)
 
 # ---------- 1. B站 login saved only ac_time_value ----------
 
@@ -144,51 +144,28 @@ def start(tmp_path, port, **kw):
     return XhsProcess(exe, port, popen=popen, clock=Clock(), sleep=lambda s: None, **kw), seen
 
 
-def test_leakless_lock_port_moved_off_2978(tmp_path, monkeypatch):
-    monkeypatch.delenv("LEAKLESS_LOCK_PORT", raising=False)
-    srv = LocalServer()
-    try:
-        proc, seen = start(tmp_path, srv.port)
-        with proc:
-            port = int(seen["env"]["LEAKLESS_LOCK_PORT"])
-        assert port != 2978 and not (2930 <= port <= 3029)
-    finally:
-        srv.close()
-
-
-def test_preset_leakless_port_is_respected(tmp_path, monkeypatch):
-    monkeypatch.setenv("LEAKLESS_LOCK_PORT", "45678")
-    srv = LocalServer()
-    try:
-        proc, seen = start(tmp_path, srv.port)
-        with proc:
-            assert seen["env"]["LEAKLESS_LOCK_PORT"] == "45678"
-    finally:
-        srv.close()
-
-
-def test_browser_stuck_is_reported_as_such(tmp_path):
+def test_unexplained_5xx_says_so_instead_of_guessing(tmp_path):
     srv = LocalServer(status_delay=True)
     try:
         proc, _ = start(tmp_path, srv.port)
-        with pytest.raises(SourceFailure, match="浏览器"):
+        with pytest.raises(SourceFailure) as e:
             with proc:
                 pass
+        assert "HTTP 504" in e.value.reason and "2978" not in e.value.reason
     finally:
         srv.close()
 
 
-def test_patch_leakless_reads_env_and_is_idempotent():
-    src = ('package leakless\n\nimport (\n\t"os"\n\t"runtime"\n)\n\nfunc New() *Launcher {\n'
-           '\treturn &Launcher{\n\t\tLock: 2978,\n\t\tpid:  make(chan int),\n\t}\n}\n')
-    out = patch_leakless(src)
-    assert "Lock: lockPort()," in out and 'os.Getenv("LEAKLESS_LOCK_PORT")' in out and '"strconv"' in out
-    assert patch_leakless(out) == out
+def test_patch_headless_browser_disables_leakless_and_is_idempotent():
+    src = "func New(options ...Option) *Browser {\n\tl := launcher.New().\n\t\tHeadless(cfg.Headless).\n}\n"
+    out = patch_headless_browser(src)
+    assert "launcher.New().Leakless(false)." in out
+    assert patch_headless_browser(out) == out
 
 
-def test_patch_leakless_refuses_unknown_source():
-    with pytest.raises(RuntimeError, match="leakless"):
-        patch_leakless("package leakless\n")
+def test_patch_headless_browser_refuses_unknown_source():
+    with pytest.raises(RuntimeError, match="headless_browser"):
+        patch_headless_browser("package headless_browser\n")
 
 
 def test_build_runs_go_with_local_caches_and_replace(tmp_path):
@@ -202,22 +179,25 @@ def test_build_runs_go_with_local_caches_and_replace(tmp_path):
             (src / "go.mod").write_text("module x\n", encoding="utf-8")
             return SimpleNamespace(returncode=0, stdout=json.dumps({"Dir": str(src)}), stderr="")
         if cmd[1:3] == ["list", "-m"]:
-            ll = tmp_path / "llsrc"
-            ll.mkdir(exist_ok=True)
-            (ll / "leakless.go").write_text('import (\n\t"os"\n\t"runtime"\n)\n\t\tLock: 2978,\n', encoding="utf-8")
-            return SimpleNamespace(returncode=0, stdout=str(ll), stderr="")
+            hb = tmp_path / "hbsrc"
+            hb.mkdir(exist_ok=True)
+            (hb / "headless_browser.go").write_text("\tl := launcher.New().\n", encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout=str(hb), stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     dest = tmp_path / "tools" / "xiaohongshu-mcp"
     build_xhs_mcp(dest, tmp_path / "work", go="go", run=run, log=lambda *a: None)
     env = calls[0][2]
     assert "goproxy.cn" in env["GOPROXY"] and str(tmp_path / "work") in env["GOMODCACHE"]
+    assert env["GOPROXY"].split("|")[:2] == ["https://goproxy.cn", "https://proxy.golang.org"]  # fall back on any error
     assert env["CGO_ENABLED"] == "0"
     flat = [" ".join(c[0]) for c in calls]
-    assert any("-replace=github.com/ysmood/leakless=" in f for f in flat)
-    assert any(f.endswith(". ") or f.endswith(" .") for f in flat if " build " in f)
+    assert any("-replace=github.com/xpzouying/headless_browser=" in f for f in flat)
+    assert not any("leakless" in f for f in flat)
     assert any("./cmd/login" in f for f in flat)
-    assert "Lock: lockPort()," in (tmp_path / "work" / "leakless" / "leakless.go").read_text(encoding="utf-8")
+    patched = (tmp_path / "work" / "headless_browser" / "headless_browser.go").read_text(encoding="utf-8")
+    assert "Leakless(false)" in patched
+    assert json.loads((dest / "build-info.json").read_text(encoding="utf-8"))["build_id"] == BUILD_ID
 
 
 def test_ensure_go_rejects_bad_checksum(tmp_path, monkeypatch):
@@ -260,3 +240,119 @@ def test_local_calls_ignore_proxy_settings(tmp_path, monkeypatch):
             assert xc.logged_in() is True
     finally:
         srv.close()
+
+
+# ---------- round 2: leakless.exe blocked by Windows Security; misleading 500 message ----------
+
+import os
+import signal
+import subprocess
+import sys
+import time
+
+from attention_budget.collectors.xhs import ProcessTree, explain_server_error
+
+VIRUS_LINE = ('time="2026-10-20T20:50:12+08:00" level=error msg="服务器内部错误: fork/exec C:\\\\Users\\\\wei\\\\'
+              'Desktop\\\\attention-budget\\\\.attention-budget\\\\runtime\\\\temp\\\\leakless-amd64-adb8\\\\leakless.exe: '
+              'Operation did not complete successfully because the file contains a virus or potentially unwanted '
+              'software., path: /api/v1/login/status"\n')
+
+
+def test_virus_block_is_explained_without_blaming_port_2978():
+    msg = explain_server_error(500, {"error": "服务器内部错误", "code": "INTERNAL_ERROR"}, VIRUS_LINE)
+    assert "Windows 安全中心" in msg and "leakless.exe" in msg and "build-xhs-mcp" in msg
+    assert "2978" not in msg
+
+
+def test_real_error_is_shown_and_secrets_are_stripped():
+    log = ('time="x" level=error msg="服务器内部错误: navigate https://www.xiaohongshu.com/explore/1?xsec_token=SECRETTOKEN123 '
+           'failed: net::ERR_PROXY_CONNECTION_FAILED Authorization: Bearer SECRETBEARER web_session=SECRETSESSION, path: /x"\n')
+    msg = explain_server_error(500, {"error": "服务器内部错误"}, log)
+    assert "ERR_PROXY_CONNECTION_FAILED" in msg
+    for secret in ("SECRETTOKEN123", "SECRETBEARER", "SECRETSESSION"):
+        assert secret not in msg
+    assert "2978" not in msg
+
+
+def test_body_error_used_when_log_has_nothing():
+    msg = explain_server_error(500, {"error": "获取Feeds列表失败", "details": "context deadline exceeded"}, "")
+    assert "获取Feeds列表失败" in msg and "context deadline exceeded" in msg
+
+
+def test_500_on_startup_reports_the_real_reason(tmp_path):
+    srv = LocalServer(status_delay=True)  # answers 500-class for login/status
+    log = tmp_path / "xhs.log"
+    try:
+        proc, _ = start(tmp_path, srv.port, log_path=log)
+        log.write_text(VIRUS_LINE, encoding="utf-8")
+        with pytest.raises(SourceFailure) as e:
+            with proc:
+                pass
+        assert "Windows 安全中心" in e.value.reason and "2978" not in e.value.reason
+    finally:
+        srv.close()
+
+
+def test_child_output_goes_to_log_file(tmp_path):
+    srv = LocalServer()
+    log = tmp_path / "logs" / "xiaohongshu-mcp.log"
+    try:
+        exe = tmp_path / "xiaohongshu-mcp.exe"
+        exe.write_bytes(b"")
+        seen = {}
+
+        def popen(args, **k):
+            seen.update(k)
+            return Proc()
+
+        with XhsProcess(exe, srv.port, popen=popen, clock=Clock(), sleep=lambda s: None, log_path=log):
+            pass
+        assert seen["stdout"] is not subprocess.DEVNULL and seen["stderr"] == subprocess.STDOUT
+        assert log.exists()
+    finally:
+        srv.close()
+
+
+def _alive(pid: int) -> bool:
+    if sys.platform == "win32":
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True).stdout
+        return str(pid) in out
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    # a zombie still answers kill(0); treat it as dead
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().split()[2] != "Z"
+    except OSError:
+        return False
+
+
+def test_stopping_kills_the_whole_process_tree(tmp_path):
+    """Stands in for xiaohongshu-mcp -> chrome.exe: the grandchild must die with the parent."""
+    pidfile = tmp_path / "child.pid"
+    script = (f"import subprocess,sys,time;p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(300)']);"
+              f"open(r'{pidfile}','w').write(str(p.pid));time.sleep(300)")
+    tree = ProcessTree.spawn([sys.executable, "-c", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(100):
+        if pidfile.exists() and pidfile.read_text():
+            break
+        time.sleep(0.05)
+    child = int(pidfile.read_text())
+    assert _alive(child)
+    tree.kill()
+    for _ in range(100):
+        if not _alive(child):
+            break
+        time.sleep(0.05)
+    assert not _alive(child) and tree.poll() is not None
+
+
+def test_old_build_is_detected(tmp_path):
+    from attention_budget.xhs_build import build_is_current
+    exe = tmp_path / "xiaohongshu-mcp.exe"
+    exe.write_bytes(b"")
+    assert build_is_current(exe) is False  # last round's build wrote no build-info.json
+    (tmp_path / "build-info.json").write_text(json.dumps({"build_id": BUILD_ID}), encoding="utf-8")
+    assert build_is_current(exe) is True

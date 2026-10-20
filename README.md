@@ -18,9 +18,11 @@
 3. **准备 xiaohongshu-mcp**（读小红书用的工具）：运行 `uv run attention-budget build-xhs-mcp`。
    它会把一个修过的 xiaohongshu-mcp 编译到数据目录的 `tools\xiaohongshu-mcp\` 下（需要时自动下载便携版 Go，
    全部放在数据目录里，不用管理员权限，大约几分钟）。
-   - 为什么不用官方发布的 exe：它依赖的 leakless 固定用 2978 端口做锁，拿不到就一直等。有些 Windows 会把
-     2930–3029 这一段端口保留给系统（`netsh interface ipv4 show excludedportrange protocol=tcp` 可以看到），
-     这时官方版的浏览器永远起不来。修过的版本改用一个空闲端口。
+   - 为什么不用官方发布的 exe：它启动浏览器时会先解压并运行一个辅助程序 `leakless.exe`。这个程序在 Windows 上
+     会被安全中心当成可疑软件拦截（错误 225），还会去占一个固定的 2978 端口（有些电脑把这个端口保留给了系统）。
+     修过的版本直接启动浏览器，不再用 `leakless.exe`；浏览器的善后由本程序负责：xiaohongshu-mcp 和它开的浏览器
+     放在同一个 Windows 作业对象里，一起启动、一起结束，即使本程序意外退出也不会留下浏览器进程。
+   - xiaohongshu-mcp 的输出记在数据目录的 `logs\xiaohongshu-mcp.log`；出错时提示里会写明真正的原因（已去掉登录凭据）。
    - 用了这个命令就不用填 `xhs.exe_path`；填了的话以你填的为准。
    第一次运行时它还会自己下载约 150MB 的浏览器，属正常现象。
 4. **生成配置**：`uv run attention-budget init`

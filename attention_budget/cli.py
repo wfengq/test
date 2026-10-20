@@ -22,7 +22,7 @@ from .ledger import AlreadyRanToday, Ledger
 from .llm import DeepSeekLLM, LLMError
 from .models import SourceFailure
 from .pipeline import SOURCE_NAME, rebuild_result, run_daily, write_report
-from .xhs_build import build_xhs_mcp, default_exe, tools_dir, xhs_exe_path
+from .xhs_build import build_is_current, build_xhs_mcp, default_exe, tools_dir, xhs_exe_path
 
 DEFAULT_HOME = Path.home() / ".attention-budget"
 TEMPLATES = Path(__file__).resolve().parent / "templates"
@@ -55,7 +55,7 @@ def make_runtime(cfg: Config):
     @contextmanager
     def xhs_factory():
         try:
-            proc = XhsProcess(xhs_exe_path(cfg), cfg.xhs.port).__enter__()
+            proc = XhsProcess(xhs_exe_path(cfg), cfg.xhs.port, log_path=cfg.data_dir / "logs" / "xiaohongshu-mcp.log").__enter__()
         except SourceFailure as e:
             yield FailedXhs(e)
             return
@@ -209,8 +209,15 @@ def _send_result(cfg, ledger: Ledger, result, dry: bool) -> None:
     _emit(cfg, ledger, format_daily(result), dry, run_id=result.run_id)
 
 
+def _warn_old_build(cfg) -> None:
+    exe = xhs_exe_path(cfg)
+    if exe and exe == default_exe(cfg.data_dir) and not build_is_current(exe):
+        print("⚠️ tools 里的 xiaohongshu-mcp 是旧的编译版本（还会用 leakless.exe），请先运行 attention-budget build-xhs-mcp")
+
+
 def cmd_check_sources(args) -> int:
     cfg = _cfg(args)
+    _warn_old_build(cfg)
     _, bili, xhs_factory = make_runtime(cfg)
     ok = True
     since = datetime.now() - timedelta(hours=24)
@@ -327,7 +334,8 @@ def cmd_build_xhs_mcp(args) -> int:
 
 def cmd_login_xhs(args) -> int:
     cfg = _cfg(args)
-    with XhsProcess(xhs_exe_path(cfg), cfg.xhs.port) as proc:
+    _warn_old_build(cfg)
+    with XhsProcess(xhs_exe_path(cfg), cfg.xhs.port, log_path=cfg.data_dir / "logs" / "xiaohongshu-mcp.log") as proc:
         xhs = XhsCollector(proc, cfg.xhs)
         if xhs.logged_in():
             print("小红书已经是登录状态")

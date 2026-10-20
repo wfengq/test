@@ -1,10 +1,12 @@
-"""Build a patched xiaohongshu-mcp whose leakless lock port is configurable.
+"""Build a patched xiaohongshu-mcp that starts its browser without leakless.
 
-Why: xiaohongshu-mcp launches its browser through go-rod, which uses ysmood/leakless. leakless v0.9.0 serialises
-extracting its helper binary with a TCP "lock" on 127.0.0.1:2978 and retries forever when it cannot bind.
-Some Windows machines exclude 2978 from binding (WinError 10013), so the browser never starts and every
-xiaohongshu-mcp call hangs. The port is hard-coded, so the only fix is a rebuild with a small patch that reads
-LEAKLESS_LOCK_PORT. Everything (Go, module cache, sources, binaries) stays inside the data directory.
+Why: xiaohongshu-mcp launches Chromium through xpzouying/headless_browser → go-rod, whose launcher by default
+wraps the browser in ysmood/leakless: it extracts a helper leakless.exe into TEMP and runs the browser through
+it. On Windows that helper (1) takes a TCP lock on the hard-coded port 2978, which some machines exclude from
+binding, and (2) is flagged by Windows Security ("file contains a virus or potentially unwanted software",
+error 225). Disabling leakless (go-rod's Launcher.Leakless(false)) starts chrome.exe directly; cleaning up the
+browser when xiaohongshu-mcp stops is done by attention-budget instead (a Windows Job Object, see
+collectors/xhs.py ProcessTree). Everything (Go, module cache, sources, binaries) stays inside the data directory.
 """
 import hashlib
 import io
@@ -21,7 +23,8 @@ import httpx
 
 XHS_MODULE = "github.com/xpzouying/xiaohongshu-mcp"
 XHS_COMMIT = "7797fd375aba02dcd33afe143f6bee13e5870859"  # 2026-10-09, the version the collector was written for
-LEAKLESS_MODULE = "github.com/ysmood/leakless"
+HB_MODULE = "github.com/xpzouying/headless_browser"
+BUILD_ID = "no-leakless-1"  # bump when the patch changes; written to build-info.json next to the exe
 GO_VERSION = "1.24.7"
 GO_TOOLCHAIN = f"golang.org/toolchain@v0.0.1-go{GO_VERSION}.windows-amd64"
 # sha256 of the module zip above, identical on every Go module proxy (verified against sum.golang.org)
@@ -30,27 +33,15 @@ GO_PROXIES = ["https://goproxy.cn", "https://proxy.golang.org"]
 EXE_NAME = "xiaohongshu-mcp.exe"
 LOGIN_EXE_NAME = "xiaohongshu-login.exe"
 
-_PATCH_FUNC = '''
-// lockPort lets the cross-process lock port be moved off 2978, which some Windows
-// machines exclude from binding (WinError 10013). Patched by attention-budget.
-func lockPort() int {
-	if v, err := strconv.Atoi(os.Getenv("LEAKLESS_LOCK_PORT")); err == nil && v > 0 && v < 65536 {
-		return v
-	}
-	return 2978
-}
-'''
+_LAUNCH = "l := launcher.New()."
 
 
-def patch_leakless(src: str) -> str:
-    if "func lockPort() int" in src:
+def patch_headless_browser(src: str) -> str:
+    if "launcher.New().Leakless(false)." in src:
         return src
-    if "Lock: 2978," not in src or '\t"runtime"\n' not in src:
-        raise RuntimeError("leakless 源码和预期不一致，无法打补丁（版本变了？）")
-    src = src.replace("Lock: 2978,", "Lock: lockPort(),", 1)
-    if '\t"strconv"\n' not in src:
-        src = src.replace('\t"runtime"\n', '\t"runtime"\n\t"strconv"\n', 1)
-    return src + _PATCH_FUNC
+    if _LAUNCH not in src:
+        raise RuntimeError("headless_browser 源码和预期不一致，无法打补丁（版本变了？）")
+    return src.replace(_LAUNCH, "l := launcher.New().Leakless(false).", 1)
 
 
 def tools_dir(data_dir: Path) -> Path:
@@ -59,6 +50,15 @@ def tools_dir(data_dir: Path) -> Path:
 
 def default_exe(data_dir: Path) -> Path:
     return tools_dir(data_dir) / "xiaohongshu-mcp" / EXE_NAME
+
+
+def build_is_current(exe: Path) -> bool:
+    """True when exe was built by this version of build-xhs-mcp (leakless disabled)."""
+    try:
+        info = json.loads((Path(exe).parent / "build-info.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return info.get("build_id") == BUILD_ID
 
 
 def xhs_exe_path(cfg) -> Path | None:
@@ -111,7 +111,7 @@ def _go_env(work: Path) -> dict:
     return {**os.environ,
             "GOPATH": str(work / "gopath"), "GOMODCACHE": str(work / "gopath" / "mod"),
             "GOCACHE": str(work / "gocache"), "GOFLAGS": "-modcacherw", "GOTOOLCHAIN": "local",
-            "GOPROXY": ",".join(GO_PROXIES) + ",direct", "CGO_ENABLED": "0"}
+            "GOPROXY": "|".join(GO_PROXIES) + "|direct", "CGO_ENABLED": "0"}
 
 
 def build_xhs_mcp(dest: Path, work: Path, go: str | None = None, run=subprocess.run,
@@ -138,21 +138,23 @@ def build_xhs_mcp(dest: Path, work: Path, go: str | None = None, run=subprocess.
     shutil.copytree(info["Dir"], src)
     _make_writable(src)
 
-    log("下载并修补 leakless……")
-    sh("mod", "download", LEAKLESS_MODULE, cwd=src)
-    ll_dir = sh("list", "-m", "-f", "{{.Dir}}", LEAKLESS_MODULE, cwd=src).strip()
-    ll = work / "leakless"
-    shutil.rmtree(ll, ignore_errors=True)
-    shutil.copytree(ll_dir, ll)
-    _make_writable(ll)
-    f = ll / "leakless.go"
-    f.write_text(patch_leakless(f.read_text(encoding="utf-8")), encoding="utf-8")
-    sh("mod", "edit", f"-replace={LEAKLESS_MODULE}={ll.as_posix()}", cwd=src)
+    log("下载并修补 headless_browser（不再使用 leakless.exe）……")
+    sh("mod", "download", HB_MODULE, cwd=src)
+    hb_dir = sh("list", "-m", "-f", "{{.Dir}}", HB_MODULE, cwd=src).strip()
+    hb = work / "headless_browser"
+    shutil.rmtree(hb, ignore_errors=True)
+    shutil.copytree(hb_dir, hb)
+    _make_writable(hb)
+    f = hb / "headless_browser.go"
+    f.write_text(patch_headless_browser(f.read_text(encoding="utf-8")), encoding="utf-8")
+    sh("mod", "edit", f"-replace={HB_MODULE}={hb.as_posix()}", cwd=src)
 
     dest.mkdir(parents=True, exist_ok=True)
     log("编译 xiaohongshu-mcp（几分钟）……")
     sh("build", "-o", str(dest / EXE_NAME), ".", cwd=src)
     sh("build", "-o", str(dest / LOGIN_EXE_NAME), "./cmd/login", cwd=src)
+    (dest / "build-info.json").write_text(json.dumps({"build_id": BUILD_ID, "xiaohongshu_mcp": XHS_COMMIT}),
+                                          encoding="utf-8")
     log(f"完成：{dest / EXE_NAME}")
     return dest / EXE_NAME
 

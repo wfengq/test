@@ -4,7 +4,7 @@ import random
 import re
 import os
 import secrets
-import socket
+import signal
 import subprocess
 import sys
 import time
@@ -33,14 +33,172 @@ SRT_TIME = re.compile(r"^\d+$|-->")
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 
-BROWSER_STUCK = ("xiaohongshu-mcp 起来了，但它的浏览器启动卡住了。常见原因是 Windows 保留了 2978 端口，"
-                 "官方版 xiaohongshu-mcp 会一直等这个端口；请运行 attention-budget build-xhs-mcp 编译修过的版本")
+LOG_MAX = 5_000_000
+STARTUP_TIMEOUT = 90
+SECRET_RE = re.compile(r"(?i)\b(xsec_token|access_token|token|web_session|session|a1|webid|sessdata|bili_jct|cookies?)"
+                       r"\s*[=:]\s*(?:bearer\s+)?[^\s,&;\"']+")
+BEARER_RE = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+")
+ERROR_LINE_RE = re.compile(r'level=error msg="(.*)"\s*$')
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def _sanitize(text: str) -> str:
+    text = BEARER_RE.sub("Bearer ***", text)
+    text = SECRET_RE.sub(lambda m: f"{m.group(1)}=***", text)
+    return text.replace("\\\\", "\\")
+
+
+def _last_server_error(log_tail: str) -> str:
+    for line in reversed(log_tail.splitlines()):
+        m = ERROR_LINE_RE.search(line)
+        if not m:
+            continue
+        msg = m.group(1)
+        if re.fullmatch(r"(GET|POST|PUT|DELETE) \S+ \d{3}", msg):  # the access-log line, not the cause
+            continue
+        msg = re.sub(r"^服务器内部错误:\s*", "", msg)
+        return re.sub(r",\s*path:\s*\S+$", "", msg)
+    return ""
+
+
+def explain_server_error(status: int, body: dict | None, log_tail: str) -> str:
+    """Turn a 5xx from xiaohongshu-mcp into the actual reason, with credentials stripped."""
+    reason = _last_server_error(log_tail)
+    if not reason and body:
+        parts = [str(body.get("error") or "")]
+        details = body.get("details")
+        if details and details != {}:
+            parts.append(details if isinstance(details, str) else str(details))
+        reason = "：".join(p for p in parts if p)
+    reason = _sanitize(reason)[:400]
+    low = reason.lower()
+    if "virus" in low or "potentially unwanted" in low or "error 225" in low:
+        blocked = re.search(r"[^\s\\/:]+\.exe", reason)
+        name = blocked.group(0) if blocked else "一个程序"
+        hint = ("这是旧的 xiaohongshu-mcp 编译版本，它还在用 leakless.exe；请重新运行 attention-budget build-xhs-mcp"
+                if "leakless" in low else "请检查这个文件来自哪里")
+        return f"xiaohongshu-mcp 启动浏览器时，{name} 被 Windows 安全中心拦截了（错误 225）。{hint}。原始错误：{reason}"
+    if reason:
+        return f"xiaohongshu-mcp 出错（HTTP {status}）：{reason}"
+    return f"xiaohongshu-mcp 出错（HTTP {status}），没有拿到具体原因"
+
+
+class ProcessTree:
+    """A child process plus everything it starts (xiaohongshu-mcp → chrome.exe), stopped together.
+
+    Windows: the child goes into a Job Object with KILL_ON_JOB_CLOSE, so its browsers die with it — also when
+    this Python process itself dies, because the OS closes the job handle then. This replaces what go-rod's
+    leakless.exe used to do. POSIX: the child leads a new session and the whole process group is signalled.
+    """
+
+    def __init__(self, popen: subprocess.Popen, job=None):
+        self.p, self.job = popen, job
+
+    @classmethod
+    def spawn(cls, args, **kw) -> "ProcessTree":
+        if sys.platform == "win32":
+            p = subprocess.Popen(args, **kw)
+            try:
+                job = _win_job_for(p)
+            except OSError:
+                p.kill()
+                raise
+            return cls(p, job)
+        kw.pop("creationflags", None)
+        return cls(subprocess.Popen(args, start_new_session=True, **kw))
+
+    def poll(self):
+        return self.p.poll()
+
+    def wait(self, timeout=None):
+        return self.p.wait(timeout=timeout)
+
+    def _signal_group(self, sig) -> None:
+        try:
+            os.killpg(self.p.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def terminate(self) -> None:
+        if self.job is not None:
+            self.job.terminate()
+        else:
+            self._signal_group(signal.SIGTERM)
+
+    def kill(self) -> None:
+        if self.job is not None:
+            self.job.terminate()
+        else:
+            self._signal_group(signal.SIGKILL)
+        try:
+            self.p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.p.kill()
+
+    def close(self) -> None:
+        """Make sure nothing in the tree survives, then release the job."""
+        self.kill()
+        if self.job is not None:
+            self.job.close()
+            self.job = None
+
+
+class _WinJob:
+    def __init__(self, handle, k32):
+        self.handle, self.k32 = handle, k32
+
+    def terminate(self) -> None:
+        if self.handle:
+            self.k32.TerminateJobObject(self.handle, 1)
+
+    def close(self) -> None:
+        if self.handle:
+            self.k32.CloseHandle(self.handle)
+            self.handle = None
+
+
+def _win_job_for(p: subprocess.Popen) -> _WinJob:
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateJobObjectW.restype = wintypes.HANDLE
+    k32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_ulonglong) for n in ("ReadOperationCount", "WriteOperationCount",
+                                                      "OtherOperationCount", "ReadTransferCount",
+                                                      "WriteTransferCount", "OtherTransferCount")]
+
+    class BASIC(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD)]
+
+    class EXTENDED(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", BASIC), ("IoInfo", IO_COUNTERS),
+                    ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    job = k32.CreateJobObjectW(None, None)
+    if not job:
+        raise ctypes.WinError(ctypes.get_last_error())
+    info = EXTENDED()
+    info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):  # ExtendedLimitInformation
+        err = ctypes.get_last_error()
+        k32.CloseHandle(job)
+        raise ctypes.WinError(err)
+    if not k32.AssignProcessToJobObject(job, wintypes.HANDLE(int(p._handle))):
+        err = ctypes.get_last_error()
+        k32.CloseHandle(job)
+        raise ctypes.WinError(err)
+    return _WinJob(job, k32)
 
 
 class XhsApiError(Exception):
@@ -48,36 +206,62 @@ class XhsApiError(Exception):
 
 
 class XhsProcess:
-    """Starts xiaohongshu-mcp headless for one round and stops it afterwards."""
+    """Starts xiaohongshu-mcp headless for one round and stops it (and its browsers) afterwards."""
 
-    def __init__(self, exe_path: Path | None, port: int, popen=subprocess.Popen, http=None,
-                 clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep):
+    def __init__(self, exe_path: Path | None, port: int, popen=ProcessTree.spawn, http=None,
+                 clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
+                 log_path: Path | None = None):
         self.exe_path, self.port = exe_path, port
         # local calls must never go through a (system) proxy: it answers 502 for 127.0.0.1
         self.popen, self.http, self.clock, self.sleep = popen, http or httpx.Client(trust_env=False), clock, sleep
         self.base_url = f"http://127.0.0.1:{port}"
         self.token = ""
         self.proc = None
+        self.log_path = Path(log_path) if log_path else None
+        self._log = None
+
+    def _open_log(self):
+        if not self.log_path:
+            return subprocess.DEVNULL
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.log_path.exists() and self.log_path.stat().st_size > LOG_MAX:
+            self.log_path.replace(self.log_path.with_suffix(".log.1"))
+        self._log = open(self.log_path, "ab")
+        return self._log
+
+    def log_tail(self, size: int = 16_000) -> str:
+        if not self.log_path or not self.log_path.exists():
+            return ""
+        with open(self.log_path, "rb") as f:
+            f.seek(max(0, self.log_path.stat().st_size - size))
+            return f.read().decode("utf-8", errors="replace")
+
+    def explain(self, status: int, body: dict | None) -> str:
+        return explain_server_error(status, body, self.log_tail())
 
     def __enter__(self) -> "XhsProcess":
         if not self.exe_path or not Path(self.exe_path).exists():
-            raise SourceFailure("xhs", "没找到 xiaohongshu-mcp，请在 config.toml 里填 xhs.exe_path")
+            raise SourceFailure("xhs", "没找到 xiaohongshu-mcp，请运行 attention-budget build-xhs-mcp，"
+                                       "或在 config.toml 里填 xhs.exe_path")
         self.token = secrets.token_urlsafe(24)
         # bind to localhost only; pass the token through the environment so it is not on the command line
         args = [str(self.exe_path), "-headless=true", f"-port=127.0.0.1:{self.port}"]
+        out = self._open_log()
         try:
-            self.proc = self.popen(args, cwd=str(Path(self.exe_path).parent), stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW,
-                                   env=self._child_env())
+            self.proc = self.popen(args, cwd=str(Path(self.exe_path).parent), stdout=out,
+                                   stderr=subprocess.STDOUT, creationflags=CREATE_NO_WINDOW,
+                                   env={**os.environ, "AUTH_TOKEN": self.token})
         except OSError as e:
+            self._close_log()
             raise SourceFailure("xhs", f"xiaohongshu-mcp 没起来：{e}") from e
         deadline = self.clock() + HEALTH_TIMEOUT
         last = "无响应"
         while self.clock() < deadline:
             if self.proc.poll() is not None:
                 self._stop()
+                reason = _sanitize(_last_server_error(self.log_tail()) or "")
                 raise SourceFailure("xhs", "xiaohongshu-mcp 启动后马上退出了（可能端口 "
-                                           f"{self.port} 被占用，或程序文件损坏）")
+                                           f"{self.port} 被占用，或程序文件损坏）" + (f"：{reason}" if reason else ""))
             try:
                 if self.http.get(f"{self.base_url}/health", timeout=2).status_code == 200:
                     self._confirm_ours()
@@ -92,26 +276,32 @@ class XhsProcess:
         raise SourceFailure("xhs", f"xiaohongshu-mcp 没起来：30 秒内健康检查不通过（{last}；"
                                    "可能是端口被占用，或首次运行还在下载浏览器）")
 
-    def _child_env(self) -> dict:
-        env = {**os.environ, "AUTH_TOKEN": self.token}
-        env.setdefault("LEAKLESS_LOCK_PORT", str(_free_port()))  # 2978 may be excluded by Windows
-        return env
-
     def _confirm_ours(self) -> None:
         """/health is unauthenticated; make sure the server answering is the one we just started,
         and that it can actually start its browser (login/status needs one)."""
         try:
-            r = self.http.get(f"{self.base_url}/api/v1/login/status", timeout=90,
+            r = self.http.get(f"{self.base_url}/api/v1/login/status", timeout=STARTUP_TIMEOUT,
                               headers={"Authorization": f"Bearer {self.token}"})
         except httpx.TimeoutException:
-            r = None
-        if r is None or r.status_code >= 500:
             self._stop()
-            raise SourceFailure("xhs", BROWSER_STUCK)
+            raise SourceFailure("xhs", f"xiaohongshu-mcp 启动浏览器超时（{STARTUP_TIMEOUT} 秒没响应）"
+                                       + (f"，日志：{self.log_path}" if self.log_path else "")) from None
         if r.status_code == 401:
             self._stop()
             raise SourceFailure("xhs", f"端口 {self.port} 被别的程序占用（可能是上次没关掉的 xiaohongshu-mcp，"
                                        "重启电脑或在任务管理器里结束它即可）")
+        if r.status_code >= 500:
+            try:
+                body = r.json()
+            except ValueError:
+                body = None
+            self._stop()
+            raise SourceFailure("xhs", self.explain(r.status_code, body))
+
+    def _close_log(self) -> None:
+        if self._log is not None:
+            self._log.close()
+            self._log = None
 
     def _stop(self) -> None:
         if self.proc is not None:
@@ -120,7 +310,11 @@ class XhsProcess:
                 self.proc.wait(timeout=10)
             except Exception:
                 self.proc.kill()
+            close = getattr(self.proc, "close", None)
+            if close:
+                close()  # kill anything left in the tree (browsers) and release the job
             self.proc = None
+        self._close_log()
 
     def __exit__(self, *exc) -> None:
         self._stop()
@@ -199,8 +393,10 @@ class XhsCollector:
         try:
             r = self.client.request(method, path, json=json, headers={"Authorization": f"Bearer {self.proc.token}"})
             body = r.json()
+            if r.status_code >= 500 and hasattr(self.proc, "explain"):
+                raise XhsApiError(f"{path}：{self.proc.explain(r.status_code, body)}")
             if r.status_code != 200 or not body.get("success"):
-                raise XhsApiError(f"{path} 返回 {r.status_code}：{body.get('message') or body.get('error') or ''}")
+                raise XhsApiError(f"{path} 返回 {r.status_code}：{_sanitize(str(body.get('message') or body.get('error') or ''))}")
         except XhsApiError as e:
             self._broken[key] = e
             raise
