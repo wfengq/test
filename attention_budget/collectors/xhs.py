@@ -210,8 +210,8 @@ class XhsProcess:
 
     def __init__(self, exe_path: Path | None, port: int, popen=ProcessTree.spawn, http=None,
                  clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
-                 log_path: Path | None = None):
-        self.exe_path, self.port = exe_path, port
+                 log_path: Path | None = None, headless: bool = True):
+        self.exe_path, self.port, self.headless = exe_path, port, headless
         # local calls must never go through a (system) proxy: it answers 502 for 127.0.0.1
         self.popen, self.http, self.clock, self.sleep = popen, http or httpx.Client(trust_env=False), clock, sleep
         self.base_url = f"http://127.0.0.1:{port}"
@@ -245,7 +245,7 @@ class XhsProcess:
                                        "或在 config.toml 里填 xhs.exe_path")
         self.token = secrets.token_urlsafe(24)
         # bind to localhost only; pass the token through the environment so it is not on the command line
-        args = [str(self.exe_path), "-headless=true", f"-port=127.0.0.1:{self.port}"]
+        args = [str(self.exe_path), f"-headless={'true' if self.headless else 'false'}", f"-port=127.0.0.1:{self.port}"]
         out = self._open_log()
         try:
             self.proc = self.popen(args, cwd=str(Path(self.exe_path).parent), stdout=out,
@@ -279,24 +279,31 @@ class XhsProcess:
     def _confirm_ours(self) -> None:
         """/health is unauthenticated; make sure the server answering is the one we just started,
         and that it can actually start its browser (login/status needs one)."""
-        try:
-            r = self.http.get(f"{self.base_url}/api/v1/login/status", timeout=STARTUP_TIMEOUT,
-                              headers={"Authorization": f"Bearer {self.token}"})
-        except httpx.TimeoutException:
-            self._stop()
-            raise SourceFailure("xhs", f"xiaohongshu-mcp 启动浏览器超时（{STARTUP_TIMEOUT} 秒没响应）"
-                                       + (f"，日志：{self.log_path}" if self.log_path else "")) from None
-        if r.status_code == 401:
-            self._stop()
-            raise SourceFailure("xhs", f"端口 {self.port} 被别的程序占用（可能是上次没关掉的 xiaohongshu-mcp，"
-                                       "重启电脑或在任务管理器里结束它即可）")
-        if r.status_code >= 500:
+        for attempt in range(2):
+            try:
+                r = self.http.get(f"{self.base_url}/api/v1/login/status", timeout=STARTUP_TIMEOUT,
+                                  headers={"Authorization": f"Bearer {self.token}"})
+            except httpx.TimeoutException:
+                self._stop()
+                raise SourceFailure("xhs", f"xiaohongshu-mcp 启动浏览器超时（{STARTUP_TIMEOUT} 秒没响应）"
+                                           + (f"，日志：{self.log_path}" if self.log_path else "")) from None
+            if r.status_code == 401:
+                self._stop()
+                raise SourceFailure("xhs", f"端口 {self.port} 被别的程序占用（可能是上次没关掉的 xiaohongshu-mcp，"
+                                           "重启电脑或在任务管理器里结束它即可）")
+            if r.status_code < 500:
+                return
             try:
                 body = r.json()
             except ValueError:
                 body = None
+            reason = self.explain(r.status_code, body)
+            # the very first browser start (new profile, first page load) can overrun xiaohongshu-mcp's own
+            # deadline once; a second try reuses the warmed-up cache
+            if attempt == 0 and "deadline exceeded" in reason:
+                continue
             self._stop()
-            raise SourceFailure("xhs", self.explain(r.status_code, body))
+            raise SourceFailure("xhs", reason)
 
     def _close_log(self) -> None:
         if self._log is not None:

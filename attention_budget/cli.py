@@ -55,7 +55,8 @@ def make_runtime(cfg: Config):
     @contextmanager
     def xhs_factory():
         try:
-            proc = XhsProcess(xhs_exe_path(cfg), cfg.xhs.port, log_path=cfg.data_dir / "logs" / "xiaohongshu-mcp.log").__enter__()
+            proc = XhsProcess(xhs_exe_path(cfg), cfg.xhs.port, log_path=cfg.data_dir / "logs" / "xiaohongshu-mcp.log",
+                    headless=cfg.xhs.headless).__enter__()
         except SourceFailure as e:
             yield FailedXhs(e)
             return
@@ -335,7 +336,8 @@ def cmd_build_xhs_mcp(args) -> int:
 def cmd_login_xhs(args) -> int:
     cfg = _cfg(args)
     _warn_old_build(cfg)
-    with XhsProcess(xhs_exe_path(cfg), cfg.xhs.port, log_path=cfg.data_dir / "logs" / "xiaohongshu-mcp.log") as proc:
+    with XhsProcess(xhs_exe_path(cfg), cfg.xhs.port, log_path=cfg.data_dir / "logs" / "xiaohongshu-mcp.log",
+                    headless=cfg.xhs.headless) as proc:
         xhs = XhsCollector(proc, cfg.xhs)
         if xhs.logged_in():
             print("小红书已经是登录状态")

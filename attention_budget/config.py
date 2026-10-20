@@ -57,6 +57,7 @@ class XhsCfg(BaseModel):
     delay_max: float = 8.0
     detail_cap: int = 40
     ocr_images: int = 6
+    headless: bool = True  # set false to watch xiaohongshu-mcp's browser when diagnosing
     key_creators: list[str] = []
 
     @field_validator("key_creators")

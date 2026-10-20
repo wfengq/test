@@ -16,6 +16,8 @@ chat_id = 0                                      # 给你的机器人发一句�
 # exe_path = 'C:\Tools\xiaohongshu-mcp\xiaohongshu-mcp.exe'
 # 特别在意的博主（最多 10 个）：在小红书里打开对方主页 → 分享 → 复制链接，粘贴到这里
 key_creators = []
+# 排查小红书问题时可以改成 false，能看到它打开的浏览器窗口
+# headless = true
 
 [budget]
 daily_picks = 5      # 每天最多推几条

@@ -24,7 +24,7 @@ import httpx
 XHS_MODULE = "github.com/xpzouying/xiaohongshu-mcp"
 XHS_COMMIT = "7797fd375aba02dcd33afe143f6bee13e5870859"  # 2026-10-09, the version the collector was written for
 HB_MODULE = "github.com/xpzouying/headless_browser"
-BUILD_ID = "no-leakless-1"  # bump when the patch changes; written to build-info.json next to the exe
+BUILD_ID = "no-leakless-2"  # bump when the patch changes; written to build-info.json next to the exe
 GO_VERSION = "1.24.7"
 GO_TOOLCHAIN = f"golang.org/toolchain@v0.0.1-go{GO_VERSION}.windows-amd64"
 # sha256 of the module zip above, identical on every Go module proxy (verified against sum.golang.org)
@@ -42,6 +42,22 @@ def patch_headless_browser(src: str) -> str:
     if _LAUNCH not in src:
         raise RuntimeError("headless_browser 源码和预期不一致，无法打补丁（版本变了？）")
     return src.replace(_LAUNCH, "l := launcher.New().Leakless(false).", 1)
+
+
+_WAIT_STABLE = "page.MustWaitStable()"
+WAIT_PATCHED_FILES = ("search.go", "user_profile.go")
+
+
+def patch_wait_for_dom(src: str, name: str) -> str:
+    """Search / user-profile pages wait for "stable" = load + no network request in flight + DOM stable.
+    The results page keeps background requests going, so it never gets there and hits the 60 s deadline
+    ("context deadline exceeded"). The home feed (which works) waits for DOM stability only; do the same.
+    The data itself is still awaited right after (window.__INITIAL_STATE__)."""
+    if _WAIT_STABLE not in src:
+        if "page.MustWaitDOMStable()" in src:
+            return src
+        raise RuntimeError(f"xiaohongshu-mcp 的 {name} 和预期不一致，无法打补丁（版本变了？）")
+    return src.replace(_WAIT_STABLE, "page.MustWaitDOMStable()")
 
 
 def tools_dir(data_dir: Path) -> Path:
@@ -137,6 +153,11 @@ def build_xhs_mcp(dest: Path, work: Path, go: str | None = None, run=subprocess.
     shutil.rmtree(src, ignore_errors=True)
     shutil.copytree(info["Dir"], src)
     _make_writable(src)
+
+    for name in WAIT_PATCHED_FILES:
+        f = src / "xiaohongshu" / name
+        if f.exists():
+            f.write_text(patch_wait_for_dom(f.read_text(encoding="utf-8"), name), encoding="utf-8")
 
     log("下载并修补 headless_browser（不再使用 leakless.exe）……")
     sh("mod", "download", HB_MODULE, cwd=src)

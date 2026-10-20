@@ -356,3 +356,83 @@ def test_old_build_is_detected(tmp_path):
     assert build_is_current(exe) is False  # last round's build wrote no build-info.json
     (tmp_path / "build-info.json").write_text(json.dumps({"build_id": BUILD_ID}), encoding="utf-8")
     assert build_is_current(exe) is True
+
+
+# ---------- round 3: search / profile pages never reach network idle ----------
+
+from attention_budget.xhs_build import patch_wait_for_dom
+
+
+def test_wait_stable_replaced_by_dom_stable():
+    src = ("\tpage.MustNavigate(searchURL)\n\tpage.MustWaitStable()\n"
+           "\tpage.MustWait(`() => window.__INITIAL_STATE__ !== undefined`)\n")
+    out = patch_wait_for_dom(src, "search.go")
+    assert "page.MustWaitDOMStable()" in out and "MustWaitStable()" not in out
+    assert "__INITIAL_STATE__" in out  # still waits for the data itself
+    assert patch_wait_for_dom(out, "search.go") == out
+
+
+def test_wait_patch_refuses_unknown_source():
+    with pytest.raises(RuntimeError, match="search.go"):
+        patch_wait_for_dom("package xiaohongshu\n", "search.go")
+
+
+def test_build_patches_search_and_profile(tmp_path):
+    calls = []
+
+    def run(cmd, cwd=None, env=None, **kw):
+        calls.append(cmd)
+        if cmd[1:3] == ["mod", "download"] and "-json" in cmd:
+            src = tmp_path / "modsrc"
+            (src / "xiaohongshu").mkdir(parents=True, exist_ok=True)
+            (src / "go.mod").write_text("module x\n", encoding="utf-8")
+            for f in ("search.go", "user_profile.go"):
+                (src / "xiaohongshu" / f).write_text("\tpage.MustWaitStable()\n", encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"Dir": str(src)}), stderr="")
+        if cmd[1:3] == ["list", "-m"]:
+            hb = tmp_path / "hbsrc"
+            hb.mkdir(exist_ok=True)
+            (hb / "headless_browser.go").write_text("\tl := launcher.New().\n", encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout=str(hb), stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    build_xhs_mcp(tmp_path / "out", tmp_path / "work", go="go", run=run, log=lambda *a: None)
+    for f in ("search.go", "user_profile.go"):
+        assert "MustWaitDOMStable()" in (tmp_path / "work" / "src" / "xiaohongshu" / f).read_text(encoding="utf-8")
+
+
+def test_cold_start_timeout_on_login_status_is_retried_once(tmp_path):
+    hits = {"n": 0}
+
+    class Http:
+        def get(self, url, timeout=None, headers=None):
+            if url.endswith("/health"):
+                return httpx.Response(200, json={})
+            hits["n"] += 1
+            if hits["n"] == 1:
+                return httpx.Response(500, json={"error": "服务器内部错误", "details": "context deadline exceeded"})
+            return httpx.Response(200, json={"success": True, "data": {"is_logged_in": True}})
+
+    exe = tmp_path / "x.exe"
+    exe.write_bytes(b"")
+    with XhsProcess(exe, 18060, popen=lambda a, **k: Proc(), http=Http(), clock=Clock(), sleep=lambda s: None):
+        pass
+    assert hits["n"] == 2
+
+
+def test_headless_can_be_turned_off_for_diagnosis(tmp_path):
+    srv = LocalServer()
+    try:
+        exe = tmp_path / "x.exe"
+        exe.write_bytes(b"")
+        seen = {}
+
+        def popen(args, **k):
+            seen["args"] = args
+            return Proc()
+
+        with XhsProcess(exe, srv.port, popen=popen, clock=Clock(), sleep=lambda s: None, headless=False):
+            pass
+        assert "-headless=false" in seen["args"]
+    finally:
+        srv.close()
