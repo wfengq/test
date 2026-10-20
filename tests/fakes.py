@@ -36,3 +36,18 @@ class FakeLLM:
 
     def count(self, name: str) -> int:
         return sum(1 for n, _ in self.calls if n == name)
+
+
+class FakeOcr:
+    """Same call shape as rapidocr_onnxruntime.RapidOCR: returns ([[box, text, score], ...], elapse)."""
+
+    def __init__(self, mapping: dict[bytes, list[str]]):
+        self.mapping = mapping
+        self.calls = 0
+
+    def __call__(self, img: bytes):
+        self.calls += 1
+        lines = self.mapping.get(img)
+        if lines is None:
+            return None, 0.0
+        return [[[[0, i], [1, i], [1, i + 1], [0, i + 1]], t, 0.9] for i, t in enumerate(lines)], 0.01
