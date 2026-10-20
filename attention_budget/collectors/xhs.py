@@ -47,7 +47,8 @@ def _sanitize(text: str) -> str:
     return text.replace("\\\\", "\\")
 
 
-def _last_server_error(log_tail: str) -> str:
+def _last_server_error(log_tail: str, path: str | None = None) -> str:
+    """Latest error line in xiaohongshu-mcp's log; with path, only a line about that request."""
     for line in reversed(log_tail.splitlines()):
         m = ERROR_LINE_RE.search(line)
         if not m:
@@ -55,14 +56,16 @@ def _last_server_error(log_tail: str) -> str:
         msg = m.group(1)
         if re.fullmatch(r"(GET|POST|PUT|DELETE) \S+ \d{3}", msg):  # the access-log line, not the cause
             continue
+        if path and not re.search(rf",\s*path:\s*{re.escape(path)}$", msg):
+            continue
         msg = re.sub(r"^服务器内部错误:\s*", "", msg)
         return re.sub(r",\s*path:\s*\S+$", "", msg)
     return ""
 
 
-def explain_server_error(status: int, body: dict | None, log_tail: str) -> str:
+def explain_server_error(status: int, body: dict | None, log_tail: str, path: str | None = None) -> str:
     """Turn a 5xx from xiaohongshu-mcp into the actual reason, with credentials stripped."""
-    reason = _last_server_error(log_tail)
+    reason = _last_server_error(log_tail, path)
     if not reason and body:
         parts = [str(body.get("error") or "")]
         details = body.get("details")
@@ -202,7 +205,18 @@ def _win_job_for(p: subprocess.Popen) -> _WinJob:
 
 
 class XhsApiError(Exception):
-    pass
+    def __init__(self, msg: str, transient: bool = False):
+        super().__init__(msg)
+        self.transient = transient
+
+
+TRANSIENT_RETRIES = 2       # extra attempts per call for a timeout-type failure
+TRANSIENT_BREAK_AFTER = 2   # calls that stayed failing after retries before an endpoint is given up for the round
+
+
+def _is_transient(reason: str) -> bool:
+    low = reason.lower()
+    return "deadline exceeded" in low or "timeout" in low or "timed out" in low
 
 
 class XhsProcess:
@@ -219,6 +233,7 @@ class XhsProcess:
         self.proc = None
         self.log_path = Path(log_path) if log_path else None
         self._log = None
+        self.login_state: bool | None = None  # what login/status said at startup; the collector reuses it
 
     def _open_log(self):
         if not self.log_path:
@@ -236,8 +251,8 @@ class XhsProcess:
             f.seek(max(0, self.log_path.stat().st_size - size))
             return f.read().decode("utf-8", errors="replace")
 
-    def explain(self, status: int, body: dict | None) -> str:
-        return explain_server_error(status, body, self.log_tail())
+    def explain(self, status: int, body: dict | None, path: str | None = None) -> str:
+        return explain_server_error(status, body, self.log_tail(), path=path)
 
     def __enter__(self) -> "XhsProcess":
         if not self.exe_path or not Path(self.exe_path).exists():
@@ -292,12 +307,16 @@ class XhsProcess:
                 raise SourceFailure("xhs", f"端口 {self.port} 被别的程序占用（可能是上次没关掉的 xiaohongshu-mcp，"
                                            "重启电脑或在任务管理器里结束它即可）")
             if r.status_code < 500:
+                try:
+                    self.login_state = bool(r.json()["data"]["is_logged_in"])
+                except (ValueError, KeyError, TypeError):
+                    self.login_state = None
                 return
             try:
                 body = r.json()
             except ValueError:
                 body = None
-            reason = self.explain(r.status_code, body)
+            reason = self.explain(r.status_code, body, path="/api/v1/login/status")
             # the very first browser start (new profile, first page load) can overrun xiaohongshu-mcp's own
             # deadline once; a second try reuses the warmed-up cache
             if attempt == 0 and "deadline exceeded" in reason:
@@ -382,6 +401,7 @@ class XhsCollector:
         self.client = client or httpx.Client(base_url=proc.base_url, timeout=120, trust_env=False)
         self._requests = 0
         self._broken: dict[tuple[str, str], XhsApiError] = {}
+        self._timeouts: dict[tuple[str, str], int] = {}
         self._tokens: dict[str, str] = {}
         self._details = 0
         self._logged_in: bool | None = None
@@ -389,31 +409,58 @@ class XhsCollector:
 
     # ---- transport ----
     def _request(self, method: str, path: str, json: dict | None = None) -> dict:
+        """One API call. Timeout-type failures (xiaohongshu-mcp starts a browser per request, which can overrun
+        its own deadline) are retried; an endpoint is only given up for the round after a permanent error or
+        after TRANSIENT_BREAK_AFTER calls that kept timing out."""
         key = (method, path)
         if key not in ALLOWED:
             raise PermissionError(f"不允许调用 {method} {path}（只读白名单之外）")
         if key in self._broken:
             raise self._broken[key]
+        err = None
+        for _ in range(TRANSIENT_RETRIES + 1):
+            try:
+                body = self._send(method, path, json)
+                self._timeouts.pop(key, None)
+                return body
+            except XhsApiError as e:
+                err = e
+                if not e.transient:
+                    self._broken[key] = e
+                    raise
+        self._timeouts[key] = self._timeouts.get(key, 0) + 1
+        if self._timeouts[key] >= TRANSIENT_BREAK_AFTER:
+            self._broken[key] = err
+        raise err
+
+    def _send(self, method: str, path: str, json: dict | None) -> dict:
         if self._requests:
             self.sleep(self.rand(self.cfg.delay_min, self.cfg.delay_max))
         self._requests += 1
         try:
             r = self.client.request(method, path, json=json, headers={"Authorization": f"Bearer {self.proc.token}"})
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            raise XhsApiError(f"{path} 请求超时或连不上：{e}", transient=True) from e
+        try:
             body = r.json()
-            if r.status_code >= 500 and hasattr(self.proc, "explain"):
-                raise XhsApiError(f"{path}：{self.proc.explain(r.status_code, body)}")
-            if r.status_code != 200 or not body.get("success"):
-                raise XhsApiError(f"{path} 返回 {r.status_code}：{_sanitize(str(body.get('message') or body.get('error') or ''))}")
-        except XhsApiError as e:
-            self._broken[key] = e
-            raise
-        except Exception as e:
-            err = XhsApiError(f"{path} 请求失败：{e}")
-            self._broken[key] = err
-            raise err from e
+        except ValueError:
+            body = None
+        if r.status_code >= 500:
+            reason = (self.proc.explain(r.status_code, body, path=path) if hasattr(self.proc, "explain")
+                      else f"HTTP {r.status_code}")
+            raise XhsApiError(f"{path}：{reason}", transient=_is_transient(reason))
+        if r.status_code != 200 or not body or not body.get("success"):
+            msg = _sanitize(str((body or {}).get("message") or (body or {}).get("error") or ""))
+            raise XhsApiError(f"{path} 返回 {r.status_code}：{msg}")
         return body
 
-    def logged_in(self) -> bool:
+    def logged_in(self, refresh: bool = False) -> bool:
+        """Reuse what XhsProcess saw at startup; ask xiaohongshu-mcp again only when refresh is requested
+        (each login/status call makes it launch a whole browser)."""
+        if refresh:
+            self._logged_in = None
+        elif self._logged_in is None and getattr(self.proc, "login_state", None) is not None:
+            self._logged_in = self.proc.login_state
         if self._logged_in is None:
             try:
                 self._logged_in = bool(self._request("GET", "/api/v1/login/status")["data"].get("is_logged_in"))

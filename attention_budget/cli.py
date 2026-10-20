@@ -103,8 +103,7 @@ def _offer_login(cfg, bili, xhs, status: dict, dry: bool) -> None:
             png = xhs.login_qr()
             send_photo(cfg.telegram.bot_token, cfg.telegram.chat_id, png,
                        "小红书没登录或被挤下线了，用小红书 App 扫这个码。" + XHS_LOGIN_HINT)
-            xhs._logged_in = None
-            _wait(xhs.logged_in)
+            _wait(lambda: xhs.logged_in(refresh=True))
         except Exception as e:
             print(f"发小红书登录二维码失败：{e}")
 
@@ -348,8 +347,7 @@ def cmd_login_xhs(args) -> int:
         print(f"用小红书 App 扫描二维码（图片：{out}）……\n{XHS_LOGIN_HINT}")
 
         def check():
-            xhs._logged_in = None
-            return xhs.logged_in()
+            return xhs.logged_in(refresh=True)
 
         ok = _wait(check)
     print("登录成功" if ok else "超时了，再运行一次 login-xhs")
