@@ -90,3 +90,9 @@ def test_review_decisions_and_minutes(tmp_path):
     assert L.awaiting_minutes(datetime.now()) == "2026-W43"
     L.set_self_reported_minutes("2026-W43", 300)
     assert L.awaiting_minutes(datetime.now()) is None
+
+
+def test_run_state_roundtrip(tmp_path):
+    L = Ledger(tmp_path / "l.db")
+    L.set_state("r", "shortlist", ["a", "b"])
+    assert L.get_state("r", "shortlist") == ["a", "b"] and L.get_state("r", "nope", {}) == {}

@@ -51,3 +51,44 @@ class FakeOcr:
         if lines is None:
             return None, 0.0
         return [[[[0, i], [1, i], [1, i + 1], [0, i + 1]], t, 0.9] for i, t in enumerate(lines)], 0.01
+
+
+class FakeCollector:
+    """Returns scripted Items per method name, or raises SourceFailure after fail_all()."""
+
+    def __init__(self, platform: str, script: dict[str, list], tool_text: str = "原文内容"):
+        self.platform = platform
+        self.script = script
+        self.tool_text = tool_text
+        self.failure: str | None = None
+        self.calls: list[str] = []
+        self.remembered: list[str] = []
+
+    def fail_all(self, reason: str) -> None:
+        self.failure = reason
+
+    def _get(self, name):
+        from attention_budget.models import SourceFailure
+        self.calls.append(name)
+        if self.failure:
+            raise SourceFailure(self.platform, self.failure)
+        return list(self.script.get(name, []))
+
+    def follow_updates(self, since, limit):
+        return self._get("follow_updates")
+
+    def recommend(self, limit):
+        return self._get("recommend")
+
+    def search(self, query, limit, scope="all"):
+        return self._get("search")
+
+    def key_creators_updates(self, links, per_creator):
+        return self._get("key_creators_updates")
+
+    def remember(self, items):
+        self.remembered += [i.id for i in items]
+
+    def tools(self):
+        names = ["subtitle", "comments", "up_recent"] if self.platform == "bili" else ["note_detail", "author_recent"]
+        return {n: (lambda *a, **k: self.tool_text) for n in names}

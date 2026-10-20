@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS notes (
   text TEXT, at TEXT, expires_at TEXT);
 CREATE TABLE IF NOT EXISTS reviews (
   week TEXT PRIMARY KEY, proposals TEXT, decisions TEXT, self_reported_minutes INTEGER, saved_at TEXT);
+CREATE TABLE IF NOT EXISTS run_state (
+  run_id TEXT, key TEXT, value TEXT, PRIMARY KEY (run_id, key));
 CREATE TABLE IF NOT EXISTS outbox (
   id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT);
 """
@@ -84,6 +86,13 @@ class Ledger:
                    capped: bool) -> None:
         self._x("UPDATE runs SET finished_at=?, status=?, source_status=?, capped=? WHERE run_id=?",
                 (_now(), status, json.dumps(source_status, ensure_ascii=False), int(capped), run_id))
+
+    def set_state(self, run_id: str, key: str, value) -> None:
+        self._x("INSERT OR REPLACE INTO run_state VALUES (?,?,?)", (run_id, key, json.dumps(value, ensure_ascii=False)))
+
+    def get_state(self, run_id: str, key: str, default=None):
+        r = self._x("SELECT value FROM run_state WHERE run_id=? AND key=?", (run_id, key)).fetchone()
+        return json.loads(r["value"]) if r else default
 
     def last_run_started_at(self) -> datetime | None:
         r = self._x("SELECT started_at FROM runs WHERE finished_at IS NOT NULL "
