@@ -1,0 +1,25 @@
+# 注意力预算 · 配置文件（改完保存即可，下次运行生效）
+
+[deepseek]
+api_key = "在这里填 DeepSeek API key"     # https://platform.deepseek.com 申请
+model = "deepseek-chat"
+# 单价：按 DeepSeek 官网当前价格填写（元 / 百万 token），只用来算花费
+price_in_per_m = 2.0
+price_out_per_m = 8.0
+
+[telegram]
+bot_token = "在这里填 Telegram 机器人的 token"   # 找 @BotFather 发 /newbot 获得
+chat_id = 0                                      # 给你的机器人发一句话后，按 README 的方法查到这个数字
+
+[xhs]
+# xiaohongshu-mcp 程序的完整路径（从它的 GitHub 发布页下载 Windows 版）
+exe_path = 'C:\Tools\xiaohongshu-mcp\xiaohongshu-mcp-windows-amd64.exe'
+# 特别在意的博主（最多 10 个）：在小红书里打开对方主页 → 分享 → 复制链接，粘贴到这里
+key_creators = []
+
+[budget]
+daily_picks = 5      # 每天最多推几条
+serendipity = 1      # 其中最多几条是"你没关注的"
+
+[schedule]
+push_time = "08:00"
