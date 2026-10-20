@@ -18,6 +18,13 @@ class AuthExpired(Exception):
     pass
 
 
+class BiliLoginError(Exception):
+    """QR login finished but did not yield a usable credential."""
+
+
+REQUIRED_CRED = ("sessdata", "bili_jct", "dedeuserid")
+
+
 def parse_count(v) -> int:
     """'1.2万' -> 12000, '300' -> 300, 5000 -> 5000."""
     if isinstance(v, (int, float)):
@@ -90,9 +97,12 @@ class RealBiliApi:
     def make_credential(self, d: dict):
         return self.b.Credential(**d)
 
-    def qr_login(self):
+    def qr_login(self, channel: str = "tv"):
+        # The web QR flow takes SESSDATA etc. from a redirect URL; when that URL carries no cookies it still
+        # reports success with an empty credential. The TV flow returns the cookies as JSON fields.
         from bilibili_api import login_v2
-        return login_v2.QrCodeLogin(platform=login_v2.QrCodeLoginChannel.WEB)
+        platform = login_v2.QrCodeLoginChannel.TV if channel == "tv" else login_v2.QrCodeLoginChannel.WEB
+        return login_v2.QrCodeLogin(platform=platform)
 
 
 class BiliCollector:
@@ -227,17 +237,22 @@ class BiliCollector:
 
     # ---- login ----
     def login_qr(self) -> tuple[bytes, Callable[[], bool]]:
-        qr = self.api.qr_login()
+        qr = self.api.qr_login("tv")
         asyncio.run(qr.generate_qrcode())
         png = qr.get_qrcode_picture().content
 
         def poll() -> bool:
-            asyncio.run(qr.check_state())
+            state = asyncio.run(qr.check_state())
+            if getattr(state, "name", state) == "TIMEOUT":
+                raise BiliLoginError("二维码过期了，请重新运行登录")
             if not qr.has_done():
                 return False
             c = qr.get_credential()
             data = {k: getattr(c, k) for k in ("sessdata", "bili_jct", "buvid3", "buvid4", "dedeuserid",
                                                "ac_time_value") if getattr(c, k, None)}
+            missing = [k for k in REQUIRED_CRED if k not in data]
+            if missing:
+                raise BiliLoginError(f"B站返回的登录信息不完整（缺少 {', '.join(missing)}），没有保存，请重新扫码")
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(json.dumps(data), encoding="utf-8")
             self._cred, self._valid = None, None

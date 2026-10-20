@@ -151,3 +151,39 @@ def test_i7_task_xml_uses_configured_weekday():
 def test_i10_task_xml_runs_as_given_user():
     xml = task_xml("b", "a.exe bot", "logon", None, user="PC\\me")
     assert xml.count("<UserId>PC\\me</UserId>") == 2
+
+
+# ---- Windows install fixes ----
+
+def test_login_bili_reports_incomplete_credential(tmp_path, monkeypatch, capsys):
+    from attention_budget.collectors.bilibili import BiliLoginError
+    cfgf = tmp_path / "config.toml"
+    cfgf.write_text('data_dir = "' + (tmp_path / "d").as_posix() + '"\n[deepseek]\napi_key="k"\n'
+                    '[telegram]\nbot_token="t"\nchat_id=42\n', encoding="utf-8")
+
+    def login_qr(self):
+        def poll():
+            raise BiliLoginError("B站返回的登录信息不完整（缺少 sessdata），没有保存，请重新扫码")
+        return b"png", poll
+
+    monkeypatch.setattr(cli.BiliCollector, "login_qr", login_qr)
+    monkeypatch.setattr(cli, "_open_file", lambda p: None)
+    assert main(["login-bili", "--config", str(cfgf)]) == 1
+    out = capsys.readouterr().out
+    assert "不完整" in out and "登录成功" not in out
+
+
+def test_build_xhs_mcp_command_builds_into_data_dir(tmp_path, monkeypatch, capsys):
+    cfgf = tmp_path / "config.toml"
+    data = tmp_path / "d"
+    cfgf.write_text('data_dir = "' + data.as_posix() + '"\n[deepseek]\napi_key="k"\n'
+                    '[telegram]\nbot_token="t"\nchat_id=42\n', encoding="utf-8")
+    seen = {}
+
+    def fake_build(dest, work, **kw):
+        seen["dest"], seen["work"] = dest, work
+        return dest / "xiaohongshu-mcp.exe"
+
+    monkeypatch.setattr(cli, "build_xhs_mcp", fake_build)
+    assert main(["build-xhs-mcp", "--config", str(cfgf)]) == 0
+    assert seen["dest"] == data / "tools" / "xiaohongshu-mcp" and seen["work"] == data / "tools" / "build"

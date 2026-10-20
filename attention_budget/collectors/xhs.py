@@ -4,6 +4,7 @@ import random
 import re
 import os
 import secrets
+import socket
 import subprocess
 import sys
 import time
@@ -32,6 +33,16 @@ SRT_TIME = re.compile(r"^\d+$|-->")
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 
+BROWSER_STUCK = ("xiaohongshu-mcp 起来了，但它的浏览器启动卡住了。常见原因是 Windows 保留了 2978 端口，"
+                 "官方版 xiaohongshu-mcp 会一直等这个端口；请运行 attention-budget build-xhs-mcp 编译修过的版本")
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 class XhsApiError(Exception):
     pass
 
@@ -39,10 +50,11 @@ class XhsApiError(Exception):
 class XhsProcess:
     """Starts xiaohongshu-mcp headless for one round and stops it afterwards."""
 
-    def __init__(self, exe_path: Path | None, port: int, popen=subprocess.Popen, http=httpx,
+    def __init__(self, exe_path: Path | None, port: int, popen=subprocess.Popen, http=None,
                  clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep):
         self.exe_path, self.port = exe_path, port
-        self.popen, self.http, self.clock, self.sleep = popen, http, clock, sleep
+        # local calls must never go through a (system) proxy: it answers 502 for 127.0.0.1
+        self.popen, self.http, self.clock, self.sleep = popen, http or httpx.Client(trust_env=False), clock, sleep
         self.base_url = f"http://127.0.0.1:{port}"
         self.token = ""
         self.proc = None
@@ -56,7 +68,7 @@ class XhsProcess:
         try:
             self.proc = self.popen(args, cwd=str(Path(self.exe_path).parent), stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW,
-                                   env={**os.environ, "AUTH_TOKEN": self.token})
+                                   env=self._child_env())
         except OSError as e:
             raise SourceFailure("xhs", f"xiaohongshu-mcp 没起来：{e}") from e
         deadline = self.clock() + HEALTH_TIMEOUT
@@ -80,10 +92,22 @@ class XhsProcess:
         raise SourceFailure("xhs", f"xiaohongshu-mcp 没起来：30 秒内健康检查不通过（{last}；"
                                    "可能是端口被占用，或首次运行还在下载浏览器）")
 
+    def _child_env(self) -> dict:
+        env = {**os.environ, "AUTH_TOKEN": self.token}
+        env.setdefault("LEAKLESS_LOCK_PORT", str(_free_port()))  # 2978 may be excluded by Windows
+        return env
+
     def _confirm_ours(self) -> None:
-        """/health is unauthenticated; make sure the server answering is the one we just started."""
-        r = self.http.get(f"{self.base_url}/api/v1/login/status", timeout=60,
-                          headers={"Authorization": f"Bearer {self.token}"})
+        """/health is unauthenticated; make sure the server answering is the one we just started,
+        and that it can actually start its browser (login/status needs one)."""
+        try:
+            r = self.http.get(f"{self.base_url}/api/v1/login/status", timeout=90,
+                              headers={"Authorization": f"Bearer {self.token}"})
+        except httpx.TimeoutException:
+            r = None
+        if r is None or r.status_code >= 500:
+            self._stop()
+            raise SourceFailure("xhs", BROWSER_STUCK)
         if r.status_code == 401:
             self._stop()
             raise SourceFailure("xhs", f"端口 {self.port} 被别的程序占用（可能是上次没关掉的 xiaohongshu-mcp，"
@@ -154,7 +178,7 @@ class XhsCollector:
                  ocr=image_text):
         self.proc, self.cfg = proc, cfg
         self.sleep, self.rand, self.ocr = sleep, rand, ocr
-        self.client = client or httpx.Client(base_url=proc.base_url, timeout=120)
+        self.client = client or httpx.Client(base_url=proc.base_url, timeout=120, trust_env=False)
         self._requests = 0
         self._broken: dict[tuple[str, str], XhsApiError] = {}
         self._tokens: dict[str, str] = {}

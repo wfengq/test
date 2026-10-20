@@ -15,13 +15,14 @@ from pathlib import Path
 from .agent.review import apply_accepted, run_review, weekly_stats
 from .bot.app import run_bot, send_messages, send_photo
 from .bot.format import Message, format_daily, format_review
-from .collectors.bilibili import BiliCollector
+from .collectors.bilibili import BiliCollector, BiliLoginError
 from .collectors.xhs import XhsCollector, XhsProcess
 from .config import Config, load_config
 from .ledger import AlreadyRanToday, Ledger
 from .llm import DeepSeekLLM, LLMError
 from .models import SourceFailure
 from .pipeline import SOURCE_NAME, rebuild_result, run_daily, write_report
+from .xhs_build import build_xhs_mcp, default_exe, tools_dir, xhs_exe_path
 
 DEFAULT_HOME = Path.home() / ".attention-budget"
 TEMPLATES = Path(__file__).resolve().parent / "templates"
@@ -54,7 +55,7 @@ def make_runtime(cfg: Config):
     @contextmanager
     def xhs_factory():
         try:
-            proc = XhsProcess(cfg.xhs.exe_path, cfg.xhs.port).__enter__()
+            proc = XhsProcess(xhs_exe_path(cfg), cfg.xhs.port).__enter__()
         except SourceFailure as e:
             yield FailedXhs(e)
             return
@@ -290,20 +291,43 @@ def _open_file(path: Path) -> None:
 
 def cmd_login_bili(args) -> int:
     cfg = _cfg(args)
+    cfg.data_dir.mkdir(parents=True, exist_ok=True)
     bili = BiliCollector(cfg.data_dir / "bili_credential.json")
     png, poll = bili.login_qr()
     out = cfg.data_dir / "bili_login_qr.png"
     out.write_bytes(png)
     _open_file(out)
     print(f"用 B 站 App 扫描二维码（图片：{out}），确认登录……")
-    ok = _wait(poll)
+    try:
+        ok = _wait(poll)
+    except BiliLoginError as e:
+        print(f"登录失败：{e}")
+        return 1
+    finally:
+        out.unlink(missing_ok=True)
+    if ok and not bili.logged_in():
+        print("凭据已保存，但 B 站说它无效，请再运行一次 login-bili")
+        return 1
     print("登录成功" if ok else "超时了，再运行一次 login-bili")
     return 0 if ok else 1
 
 
+def cmd_build_xhs_mcp(args) -> int:
+    cfg = _cfg(args)
+    dest = default_exe(cfg.data_dir).parent
+    try:
+        exe = build_xhs_mcp(dest, tools_dir(cfg.data_dir) / "build")
+    except RuntimeError as e:
+        print(f"编译失败：{e}")
+        return 1
+    if cfg.xhs.exe_path and Path(cfg.xhs.exe_path) != exe:
+        print(f"注意：config.toml 里 xhs.exe_path 还指向 {cfg.xhs.exe_path}；改成 {exe} 或删掉这一行，才会用新编译的版本")
+    return 0
+
+
 def cmd_login_xhs(args) -> int:
     cfg = _cfg(args)
-    with XhsProcess(cfg.xhs.exe_path, cfg.xhs.port) as proc:
+    with XhsProcess(xhs_exe_path(cfg), cfg.xhs.port) as proc:
         xhs = XhsCollector(proc, cfg.xhs)
         if xhs.logged_in():
             print("小红书已经是登录状态")
@@ -371,6 +395,7 @@ def main(argv: list[str] | None = None) -> int:
     add("init", cmd_init, "创建配置文件和兴趣说明模板")
     add("login-bili", cmd_login_bili, "扫码登录 B 站")
     add("login-xhs", cmd_login_xhs, "扫码登录小红书（通过 xiaohongshu-mcp）")
+    add("build-xhs-mcp", cmd_build_xhs_mcp, "编译修过 2978 端口问题的 xiaohongshu-mcp（放在数据目录 tools 下）")
     add("check-sources", cmd_check_sources, "检查各来源能不能拉到内容（不调 AI、不推送）")
     r = add("run", cmd_run, "跑今天这一轮")
     r.add_argument("--force", action="store_true", help="今天已经跑过也再跑一次")

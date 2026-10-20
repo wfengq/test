@@ -12,8 +12,8 @@ bot_token = "在这里填 Telegram 机器人的 token"   # 找 @BotFather 发 /n
 chat_id = 0                                      # 给你的机器人发一句话后，按 README 的方法查到这个数字
 
 [xhs]
-# xiaohongshu-mcp 程序的完整路径（从它的 GitHub 发布页下载 Windows 版）
-exe_path = 'C:\Tools\xiaohongshu-mcp\xiaohongshu-mcp-windows-amd64.exe'
+# xiaohongshu-mcp：运行 attention-budget build-xhs-mcp 后留空即可；想用别的版本时填完整路径
+# exe_path = 'C:\Tools\xiaohongshu-mcp\xiaohongshu-mcp.exe'
 # 特别在意的博主（最多 10 个）：在小红书里打开对方主页 → 分享 → 复制链接，粘贴到这里
 key_creators = []
 

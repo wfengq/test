@@ -15,9 +15,14 @@
    `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`
 2. **下载本项目**并进入目录，运行 `uv sync`（会自动装好 Python 3.12 和依赖）。
    之后所有命令都写成 `uv run attention-budget <命令>`。
-3. **下载 xiaohongshu-mcp**：到 https://github.com/xpzouying/xiaohongshu-mcp 的 Releases 页，下载
-   `xiaohongshu-mcp-windows-amd64.exe`，放到一个固定目录（例如 `C:\Tools\xiaohongshu-mcp\`）。
-   第一次运行时它会自己再下载约 150MB 的浏览器，属正常现象。
+3. **准备 xiaohongshu-mcp**（读小红书用的工具）：运行 `uv run attention-budget build-xhs-mcp`。
+   它会把一个修过的 xiaohongshu-mcp 编译到数据目录的 `tools\xiaohongshu-mcp\` 下（需要时自动下载便携版 Go，
+   全部放在数据目录里，不用管理员权限，大约几分钟）。
+   - 为什么不用官方发布的 exe：它依赖的 leakless 固定用 2978 端口做锁，拿不到就一直等。有些 Windows 会把
+     2930–3029 这一段端口保留给系统（`netsh interface ipv4 show excludedportrange protocol=tcp` 可以看到），
+     这时官方版的浏览器永远起不来。修过的版本改用一个空闲端口。
+   - 用了这个命令就不用填 `xhs.exe_path`；填了的话以你填的为准。
+   第一次运行时它还会自己下载约 150MB 的浏览器，属正常现象。
 4. **生成配置**：`uv run attention-budget init`
    会创建 `%USERPROFILE%\.attention-budget\config.toml` 和 `profile\interests.md`。
 
@@ -29,10 +34,11 @@
 | `deepseek.price_in_per_m` / `price_out_per_m` | 按 DeepSeek 官网当前价格填（元 / 百万 token），只用来算每天花了多少钱 |
 | `telegram.bot_token` | 在 Telegram 里找 @BotFather，发 `/newbot`，按提示建一个机器人，得到 token |
 | `telegram.chat_id` | 先给你的机器人随便发一句话，然后在浏览器打开 `https://api.telegram.org/bot<你的token>/getUpdates`，找到 `"chat":{"id": 数字` 里的那个数字 |
-| `xhs.exe_path` | 第 3 步里 xiaohongshu-mcp 的完整路径 |
+| `xhs.exe_path` | 留空即可（用第 3 步编译的版本）；想用别的 xiaohongshu-mcp 时再填完整路径 |
 | `xhs.key_creators` | （可选）最多 10 位你特别在意的小红书博主：打开对方主页 → 分享 → 复制链接，粘贴进来 |
 
 > 网络：Telegram 在国内需要代理。在运行前设置环境变量 `HTTPS_PROXY`（例如 `http://127.0.0.1:7890`）即可，程序会自动走代理。
+> 程序和本机 xiaohongshu-mcp（127.0.0.1）之间的通信一律不走代理，不需要再设 `NO_PROXY`。
 
 ## 写兴趣说明（`profile\interests.md`）
 
@@ -40,7 +46,7 @@
 
 ## 登录
 
-- **B 站**：`uv run attention-budget login-bili`，用 B 站 App 扫弹出的二维码。
+- **B 站**：`uv run attention-budget login-bili`，用 B 站 App 扫弹出的二维码。程序会检查拿到的凭据是否完整、是否有效，不完整时会说明原因并且不保存。
 - **小红书**：`uv run attention-budget login-xhs`，用小红书 App 扫码。
   - ⚠️ **同一个小红书账号不能同时在两个网页端登录**：登录之后，不要再在电脑浏览器里登录小红书网页版，否则会互相挤掉（手机 App 不受影响）。
   - 新号会被要求实名认证，建议先实名。
