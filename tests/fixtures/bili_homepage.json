@@ -1,0 +1,4 @@
+{"item": [
+ {"bvid": "BV1rec", "title": "推荐的视频", "owner": {"mid": 21, "name": "UP丙"}, "pubdate": 1760900000, "stat": {"view": 5000}, "uri": "https://www.bilibili.com/video/BV1rec"},
+ {"bvid": "", "title": "广告卡片", "owner": {"mid": 0, "name": ""}, "pubdate": 0, "stat": {"view": 0}, "uri": ""}
+]}

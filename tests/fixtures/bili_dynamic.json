@@ -1,0 +1,6 @@
+{"has_more": false, "offset": "0", "items": [
+ {"id_str": "1", "modules": {"module_author": {"name": "UP甲", "mid": 11, "pub_ts": 1792490400},
+   "module_dynamic": {"major": {"type": "MAJOR_TYPE_ARCHIVE", "archive": {"bvid": "BV1new", "title": "新视频：Agent 记忆实测", "desc": "实测三种记忆方案", "stat": {"play": "1.2万"}, "jump_url": "//www.bilibili.com/video/BV1new/"}}}}},
+ {"id_str": "2", "modules": {"module_author": {"name": "UP乙", "mid": 12, "pub_ts": 1792400400},
+   "module_dynamic": {"major": {"type": "MAJOR_TYPE_ARCHIVE", "archive": {"bvid": "BV1old", "title": "旧视频", "desc": "", "stat": {"play": "300"}, "jump_url": "//www.bilibili.com/video/BV1old/"}}}}}
+]}
