@@ -616,7 +616,7 @@ def test_note_with_two_weeks_expires_in_14_days(tmp_path):
     assert L.active_notes(now + timedelta(days=13)) and not L.active_notes(now + timedelta(days=15))
 ```
 
-（item_id 自身含冒号，如 `x:1`；callback 解析从右侧切分：`data.rsplit(":", 1)`。`result_with(...)` 为测试工厂。）
+（item_id 自身含冒号，如 `xhs:1`；callback 解析从右侧切分：`data.rsplit(":", 1)`。`result_with(...)` 为测试工厂。）
 
 - [ ] **Step 2: 运行确认失败** — `uv run pytest tests/test_bot_format.py tests/test_bot_app.py -v`
 - [ ] **Step 3: 实现** `format.py`、`app.py`
