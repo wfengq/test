@@ -436,3 +436,59 @@ def test_headless_can_be_turned_off_for_diagnosis(tmp_path):
         assert "-headless=false" in seen["args"]
     finally:
         srv.close()
+
+
+# ---------- round 4: login check panics in MustWaitLoad (login.go:23) ----------
+
+from attention_budget.xhs_build import patch_load_waits
+
+LOGIN_SRC = ('func (a *LoginAction) CheckLoginStatus(ctx context.Context) (bool, error) {\n'
+             '\tpp := a.page.Context(ctx).Timeout(30 * time.Second)\n'
+             '\tpp.MustNavigate("https://www.xiaohongshu.com/explore").MustWaitLoad()\n'
+             '\ttime.Sleep(1 * time.Second)\n'
+             '\texists, _, err := pp.Has(`.main-container .user .link-wrapper .channel`)\n}\n'
+             'func (a *LoginAction) Login(ctx context.Context) error {\n'
+             '\tpp.MustNavigate("https://www.xiaohongshu.com/explore").MustWaitLoad()\n}\n')
+READY_SRC = ('func waitFeedPageReady(page *rod.Page) {\n\tpage.MustWaitLoad()\n\n'
+             '\tif _, err := page.Timeout(feedReadyTimeout).Element(feedReadySelectors); err != nil {\n\t}\n}\n')
+
+
+def test_login_waits_for_dom_not_the_load_event():
+    out = patch_load_waits(LOGIN_SRC, "login.go")
+    assert "MustWaitLoad" not in out and out.count(".MustWaitDOMStable()") == 2
+    assert ".main-container .user .link-wrapper .channel" in out  # same login check afterwards
+    assert patch_load_waits(out, "login.go") == out
+
+
+def test_feed_detail_drops_the_load_wait_but_keeps_the_container_wait():
+    out = patch_load_waits(READY_SRC, "page_ready.go")
+    assert "MustWaitLoad" not in out and "Element(feedReadySelectors)" in out
+    assert patch_load_waits(out, "page_ready.go") == out
+
+
+def test_load_patch_refuses_unknown_source():
+    with pytest.raises(RuntimeError, match="login.go"):
+        patch_load_waits("package xiaohongshu\n", "login.go")
+
+
+def test_build_patches_login_and_detail(tmp_path):
+    def run(cmd, cwd=None, env=None, **kw):
+        if cmd[1:3] == ["mod", "download"] and "-json" in cmd:
+            src = tmp_path / "modsrc"
+            (src / "xiaohongshu").mkdir(parents=True, exist_ok=True)
+            (src / "go.mod").write_text("module x\n", encoding="utf-8")
+            (src / "xiaohongshu" / "login.go").write_text(LOGIN_SRC, encoding="utf-8")
+            (src / "xiaohongshu" / "page_ready.go").write_text(READY_SRC, encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"Dir": str(src)}), stderr="")
+        if cmd[1:3] == ["list", "-m"]:
+            hb = tmp_path / "hbsrc"
+            hb.mkdir(exist_ok=True)
+            (hb / "headless_browser.go").write_text("\tl := launcher.New().\n", encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout=str(hb), stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    build_xhs_mcp(tmp_path / "out", tmp_path / "work", go="go", run=run, log=lambda *a: None)
+    for f in ("login.go", "page_ready.go"):
+        assert "MustWaitLoad" not in (tmp_path / "work" / "src" / "xiaohongshu" / f).read_text(encoding="utf-8")
+    assert json.loads((tmp_path / "out" / "build-info.json").read_text(encoding="utf-8"))["build_id"] == BUILD_ID
+    assert BUILD_ID == "no-leakless-3"

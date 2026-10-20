@@ -24,7 +24,7 @@ import httpx
 XHS_MODULE = "github.com/xpzouying/xiaohongshu-mcp"
 XHS_COMMIT = "7797fd375aba02dcd33afe143f6bee13e5870859"  # 2026-10-09, the version the collector was written for
 HB_MODULE = "github.com/xpzouying/headless_browser"
-BUILD_ID = "no-leakless-2"  # bump when the patch changes; written to build-info.json next to the exe
+BUILD_ID = "no-leakless-3"  # bump when the patch changes; written to build-info.json next to the exe
 GO_VERSION = "1.24.7"
 GO_TOOLCHAIN = f"golang.org/toolchain@v0.0.1-go{GO_VERSION}.windows-amd64"
 # sha256 of the module zip above, identical on every Go module proxy (verified against sum.golang.org)
@@ -58,6 +58,30 @@ def patch_wait_for_dom(src: str, name: str) -> str:
             return src
         raise RuntimeError(f"xiaohongshu-mcp 的 {name} 和预期不一致，无法打补丁（版本变了？）")
     return src.replace(_WAIT_STABLE, "page.MustWaitDOMStable()")
+
+
+LOAD_PATCHED_FILES = ("login.go", "page_ready.go")
+_READY_WAIT = "\tpage.MustWaitLoad()\n"
+_READY_PATCHED = ("\t// attention-budget: no wait for the load event (one stalled sub-resource keeps it from ever firing);\n"
+                  "\t// the container wait below bounds this instead\n")
+
+
+def patch_load_waits(src: str, name: str) -> str:
+    """The login check (login.go) and the note-detail page (page_ready.go) wait for the page's load event,
+    which only fires once every image/ad/tracker has finished. One stalled sub-resource and the 30 s login
+    check panics with "context deadline exceeded" although the page is usable. Wait for the DOM instead, as
+    the working home feed does; the detail page already waits for its content container right after."""
+    if name == "page_ready.go":
+        if _READY_PATCHED in src:
+            return src
+        if _READY_WAIT not in src:
+            raise RuntimeError(f"xiaohongshu-mcp 的 {name} 和预期不一致，无法打补丁（版本变了？）")
+        return src.replace(_READY_WAIT, _READY_PATCHED, 1)
+    if ".MustWaitLoad()" not in src:
+        if ".MustWaitDOMStable()" in src:
+            return src
+        raise RuntimeError(f"xiaohongshu-mcp 的 {name} 和预期不一致，无法打补丁（版本变了？）")
+    return src.replace(".MustWaitLoad()", ".MustWaitDOMStable()")
 
 
 def tools_dir(data_dir: Path) -> Path:
@@ -158,6 +182,10 @@ def build_xhs_mcp(dest: Path, work: Path, go: str | None = None, run=subprocess.
         f = src / "xiaohongshu" / name
         if f.exists():
             f.write_text(patch_wait_for_dom(f.read_text(encoding="utf-8"), name), encoding="utf-8")
+    for name in LOAD_PATCHED_FILES:
+        f = src / "xiaohongshu" / name
+        if f.exists():
+            f.write_text(patch_load_waits(f.read_text(encoding="utf-8"), name), encoding="utf-8")
 
     log("下载并修补 headless_browser（不再使用 leakless.exe）……")
     sh("mod", "download", HB_MODULE, cwd=src)
