@@ -81,3 +81,23 @@ def format_daily(r: RunResult) -> list[Message]:
     bill_header = "🧾 今日账单" + (f"\n值得看但没名额（{len(missed)} 条）：" if missed else "")
     bill = _pack(bill_header, missed, "\n".join(lines))
     return main + bill
+
+
+def _pct(v) -> str:
+    return "—" if v is None else f"{v:.0%}"
+
+
+def format_review(week: str, stats: dict, result) -> list[Message]:
+    head = (f"🗓 {week} 复盘\n推送 {stats['pushed']} 条，有用率 {_pct(stats['useful_rate'])}；"
+            f"没名额里的有用率 {_pct(stats['missed_useful_rate'])}；意外发现有用率 {_pct(stats['serendipity_useful_rate'])}")
+    if result.new_interest_suggestions:
+        head += "\n\n要不要把这些方向加进你的兴趣？（直接回复告诉我）\n" + "\n".join(
+            f"- {s}" for s in result.new_interest_suggestions)
+    blocks = [(f"{i + 1}. {p.change}\n理由：{p.reason}", [("✅ 采纳", f"rv:{week}:{i}:y"), ("❌ 不采纳", f"rv:{week}:{i}:n")],
+               (f"proposal:{i}", "review")) for i, p in enumerate(result.proposals)]
+    if not blocks:
+        head += "\n\n这周没有要改的地方。"
+    msgs = _pack(head, blocks, "这周大概刷了多久 B 站和小红书？回个分钟数就行")
+    for m in msgs:
+        m.slots = []  # review messages are not item pushes
+    return msgs

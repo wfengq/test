@@ -55,3 +55,14 @@ class FinalResult(BaseModel):
     picks: list[RankedId]
     serendipity: Serendipity | None = None
     reject_summary: list[RejectCount] = []
+
+
+class Proposal(BaseModel):
+    change: str
+    reason: str = ""
+    evidence_ids: list[str] = []
+
+
+class ReviewResult(BaseModel):
+    proposals: list[Proposal]
+    new_interest_suggestions: list[str] = []
