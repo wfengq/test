@@ -91,3 +91,63 @@ def test_task_xml_catches_up_missed_runs():
 def test_task_xml_weekly_and_logon():
     assert "<Sunday />" in task_xml("w", "a.exe review", "weekly", "20:00")
     assert "<LogonTrigger>" in task_xml("b", "a.exe bot", "logon", None)
+
+
+# ---- final review fixes ----
+
+def test_i2_crash_before_send_is_resent_next_start(ready_env, monkeypatch):
+    calls = []
+
+    def flaky(*a, **k):
+        calls.append(a)
+        if len(calls) == 1:
+            raise RuntimeError("console closed")
+
+    monkeypatch.setattr(cli, "send_messages", flaky)
+    assert main(["run", "--config", str(ready_env.config)]) == 1
+    assert main(["run", "--config", str(ready_env.config)]) == 0
+    # call 1 crashed, call 2 was the "没跑成" notice, call 3 is the resend of the real push
+    assert "今天没跑成" in calls[1][2][0].text and any("今天的 5 条" in m.text for m in calls[-1][2])
+
+
+def test_i5_unexpected_error_sends_failure_and_logs(ready_env, monkeypatch):
+    def boom(*a, **k):
+        raise ValueError("坏了")
+
+    monkeypatch.setattr(cli, "run_daily", boom)
+    assert main(["run", "--config", str(ready_env.config)]) == 1
+    texts = [m.text for call in ready_env.sent for m in call[2]]
+    assert any("今天没跑成" in t and "ValueError" in t for t in texts)
+    logs = list((ready_env.config.parent / "data" / "logs").glob("*.log"))
+    assert logs and "坏了" in logs[0].read_text(encoding="utf-8")
+
+
+def test_i6_dry_run_does_not_use_up_the_day(ready_env, capsys):
+    assert main(["run", "--dry-run", "--config", str(ready_env.config)]) == 0
+    assert main(["run", "--config", str(ready_env.config)]) == 0
+    assert len(ready_env.sent) == 1 and any("今天的 5 条" in m.text for m in ready_env.sent[0][2])
+
+
+def test_i8_concurrent_start_is_refused(ready_env, capsys):
+    lock = ready_env.config.parent / "data" / "run.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("12345", encoding="utf-8")
+    assert main(["run", "--config", str(ready_env.config)]) == 0
+    assert "正在跑" in capsys.readouterr().out and ready_env.sent == []
+
+
+def test_i7_review_week_on_review_day_and_after():
+    from datetime import date
+    from attention_budget.cli import review_week_start
+    sunday, monday = date(2026, 10, 25), date(2026, 10, 26)
+    assert review_week_start(sunday, review_weekday=6) == date(2026, 10, 19)
+    assert review_week_start(monday, review_weekday=6) == date(2026, 10, 19)
+
+
+def test_i7_task_xml_uses_configured_weekday():
+    assert "<Saturday />" in task_xml("w", "a.exe review", "weekly", "20:00", weekday=5)
+
+
+def test_i10_task_xml_runs_as_given_user():
+    xml = task_xml("b", "a.exe bot", "logon", None, user="PC\\me")
+    assert xml.count("<UserId>PC\\me</UserId>") == 2

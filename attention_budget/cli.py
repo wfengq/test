@@ -1,5 +1,6 @@
 """Command line: attention-budget init | login-bili | login-xhs | check-sources | run | review | bot | install-tasks."""
 import argparse
+import logging
 import os
 import shutil
 import subprocess
@@ -8,6 +9,7 @@ import tempfile
 import time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from .agent.review import apply_accepted, run_review, weekly_stats
@@ -19,16 +21,19 @@ from .config import Config, load_config
 from .ledger import AlreadyRanToday, Ledger
 from .llm import DeepSeekLLM, LLMError
 from .models import SourceFailure
-from .pipeline import SOURCE_NAME, run_daily, write_report
+from .pipeline import SOURCE_NAME, rebuild_result, run_daily, write_report
 
 DEFAULT_HOME = Path.home() / ".attention-budget"
 TEMPLATES = Path(__file__).resolve().parent / "templates"
 LOGIN_WAIT = 180
+LOCK_STALE = 3 * 3600  # seconds; a lock older than this belongs to a crashed run
 XHS_LOGIN_HINT = "登录后不要在电脑浏览器登录小红书网页版，否则会把它挤下线（手机 App 不受影响）"
 
 
 class FailedXhs:
     """Stands in for the Xiaohongshu collector when xiaohongshu-mcp could not start."""
+
+    warnings: list[str] = []
 
     def __init__(self, failure: SourceFailure):
         self.failure = failure
@@ -111,28 +116,96 @@ def _wait(check, seconds: int = LOGIN_WAIT) -> bool:
     return False
 
 
+def _logger(cfg) -> logging.Logger:
+    log = logging.getLogger("attention_budget")
+    path = (cfg.data_dir / "logs" / "attention-budget.log").resolve()
+    if not any(getattr(h, "baseFilename", None) == str(path) for h in log.handlers):
+        for old in list(log.handlers):
+            log.removeHandler(old)
+            old.close()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        h = RotatingFileHandler(path, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        log.addHandler(h)
+        log.setLevel(logging.INFO)
+    return log
+
+
+@contextmanager
+def _run_lock(cfg):
+    """One round at a time: a manual run while the scheduled one is still going would double-push."""
+    lock = cfg.data_dir / "run.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    if lock.exists() and time.time() - lock.stat().st_mtime > LOCK_STALE:
+        lock.unlink(missing_ok=True)
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        yield False
+        return
+    try:
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        yield True
+    finally:
+        lock.unlink(missing_ok=True)
+
+
 def cmd_run(args) -> int:
     cfg = _cfg(args)
-    ledger = _ledger(cfg)
+    log = _logger(cfg)
+    # a dry run gets its own ledger so it never uses up the day or hides items from the real run
+    ledger = Ledger(cfg.data_dir / ("ledger-dryrun.db" if args.dry_run else "ledger.db"))
+    with _run_lock(cfg) as got:
+        if not got:
+            print("正在跑，稍后再看（另一个 attention-budget run 还没结束）")
+            return 0
+        try:
+            return _run(cfg, ledger, args, log)
+        except Exception as e:  # never fail silently (spec §7)
+            log.exception("run failed")
+            try:
+                _emit(cfg, ledger, [Message(f"⚠️ 今天没跑成：{type(e).__name__}: {e}")], args.dry_run)
+            except Exception:
+                log.exception("could not send the failure message")
+            return 1
+
+
+def _run(cfg, ledger: Ledger, args, log) -> int:
     llm, bili, xhs_factory = make_runtime(cfg)
     try:
         with xhs_factory() as xhs:
             result = run_daily(cfg, ledger, llm, bili, xhs, datetime.now(), force=args.force)
+            log.info("run %s: %s, %d picks", result.run_id, result.status, len(result.picks))
+            if result.status != "failed":
+                _send_result(cfg, ledger, result, args.dry_run)
             _offer_login(cfg, bili, xhs, result.source_status, args.dry_run)
     except AlreadyRanToday:
+        run_id = ledger.latest_run(date.today())
+        if run_id and not args.dry_run and not ledger.has_pushes(run_id):
+            result = rebuild_result(cfg, ledger, run_id)  # finished but the push never went out: send it now
+            if result.status != "failed":
+                log.info("resending unsent run %s", run_id)
+                _send_result(cfg, ledger, result, args.dry_run)
+                return 0
         print("今天已经跑过了（要再跑一次请加 --force）")
         return 0
     except LLMError as e:
-        _emit(cfg, ledger, [Message(f"⚠️ 今天没跑成：DeepSeek 出错（{e}）。下次运行会从断点接着跑。")], args.dry_run)
+        log.exception("DeepSeek failed")
+        _emit(cfg, ledger, [Message(f"⚠️ 今天没跑成：DeepSeek 出错（{e}）。今天手动再运行一次 run 会从断点接着跑。")],
+              args.dry_run)
         return 1
     if result.status == "failed":
         reasons = "；".join(f"{SOURCE_NAME.get(k, k)}：{v}" for k, v in result.source_status.items()) or "没采到任何内容"
         _emit(cfg, ledger, [Message(f"⚠️ 今天没跑成：{reasons}")], args.dry_run)
         return 1
-    report = write_report(result, cfg.data_dir / "reports")
-    result.extra["report"] = str(report)
-    _emit(cfg, ledger, format_daily(result), args.dry_run, run_id=result.run_id)
     return 0
+
+
+def _send_result(cfg, ledger: Ledger, result, dry: bool) -> None:
+    report = write_report(result, cfg.data_dir / ("reports-dryrun" if dry else "reports"))
+    result.extra["report"] = str(report)
+    _emit(cfg, ledger, format_daily(result), dry, run_id=result.run_id)
 
 
 def cmd_check_sources(args) -> int:
@@ -158,12 +231,17 @@ def cmd_check_sources(args) -> int:
     return 0 if ok else 1
 
 
+def review_week_start(today: date, review_weekday: int) -> date:
+    """On the review day, review this week; when catching up later, review the last full week."""
+    monday = today - timedelta(days=today.weekday())
+    return monday if today.weekday() >= review_weekday else monday - timedelta(days=7)
+
+
 def cmd_review(args) -> int:
     cfg = _cfg(args)
     ledger = _ledger(cfg)
     llm, _, _ = make_runtime(cfg)
-    today = date.today()
-    week_start = today - timedelta(days=today.weekday())
+    week_start = review_week_start(date.today(), cfg.schedule.review_weekday)
     week, res = run_review(llm, ledger, cfg.data_dir / "profile", week_start)
     _emit(cfg, ledger, format_review(week, weekly_stats(ledger, week_start), res), args.dry_run)
     return 0
@@ -255,16 +333,23 @@ def cmd_install_tasks(args) -> int:
         print("只在 Windows 上需要安装计划任务")
         return 1
     cfg = _cfg(args)
-    exe = shutil.which("attention-budget") or sys.argv[0]
+    # the windowless entry point keeps a console from popping up (and the bot from dying when one is closed)
+    exe = shutil.which("attention-budget-bg") or shutil.which("attention-budget") or sys.argv[0]
+    user = f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}".lstrip("\\")
     times = {"daily": cfg.schedule.push_time, "weekly": cfg.schedule.review_time, "logon": None}
+    failed = 0
     for name, sub, trig in TASKS:
-        xml = task_xml(name, f'"{exe}" {sub}', trig, times[trig])
+        xml = task_xml(name, f'"{exe}" {sub}', trig, times[trig], weekday=cfg.schedule.review_weekday, user=user)
         with tempfile.NamedTemporaryFile("w", suffix=".xml", delete=False, encoding="utf-16") as f:
             f.write(xml)
-        subprocess.run(["schtasks", "/Create", "/TN", name, "/XML", f.name, "/F"], check=True)
+        r = subprocess.run(["schtasks", "/Create", "/TN", name, "/XML", f.name, "/F"], capture_output=True, text=True)
         Path(f.name).unlink(missing_ok=True)
-        print(f"已安装计划任务：{name}")
-    return 0
+        if r.returncode == 0:
+            print(f"已安装计划任务：{name}")
+        else:
+            failed += 1
+            print(f"安装 {name} 失败：{(r.stderr or r.stdout).strip()}（可以试试用管理员身份运行）")
+    return 1 if failed else 0
 
 
 def cmd_uninstall_tasks(args) -> int:

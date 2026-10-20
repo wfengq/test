@@ -94,6 +94,22 @@ class Ledger:
         r = self._x("SELECT value FROM run_state WHERE run_id=? AND key=?", (run_id, key)).fetchone()
         return json.loads(r["value"]) if r else default
 
+    def run_day(self, run_id: str) -> str:
+        r = self._x("SELECT date FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        return r["date"] if r else ""
+
+    def latest_run(self, day: date) -> str | None:
+        r = self._x("SELECT run_id FROM runs WHERE date=? ORDER BY started_at DESC LIMIT 1", (day.isoformat(),)).fetchone()
+        return r["run_id"] if r else None
+
+    def has_pushes(self, run_id: str) -> bool:
+        return self._x("SELECT 1 FROM pushes WHERE run_id=? LIMIT 1", (run_id,)).fetchone() is not None
+
+    def followed_authors(self) -> set[str]:
+        rows = self._x("SELECT json_extract(data, '$.author_id') AS a FROM items "
+                       "WHERE json_extract(data, '$.channel') = 'follow'").fetchall()
+        return {r["a"] for r in rows if r["a"]}
+
     def last_run_started_at(self) -> datetime | None:
         r = self._x("SELECT started_at FROM runs WHERE finished_at IS NOT NULL "
                     "ORDER BY started_at DESC LIMIT 1").fetchone()

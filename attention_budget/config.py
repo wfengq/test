@@ -64,6 +64,9 @@ class XhsCfg(BaseModel):
     def _limit(cls, v: list[str]) -> list[str]:
         if len(v) > MAX_KEY_CREATORS:
             raise ValueError(f"xhs.key_creators 最多 {MAX_KEY_CREATORS} 个，现在有 {len(v)} 个")
+        for link in v:
+            if "/user/profile/" not in link or "xsec_token=" not in link:
+                raise ValueError(f"xhs.key_creators 里这条链接缺 xsec_token，请从小红书里重新复制分享链接：{link}")
         return v
 
 

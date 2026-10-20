@@ -95,3 +95,56 @@ def test_report_written(env_full):
     text = f.read_text(encoding="utf-8")
     missed = text.split("值得看但没名额")[1].split("## 账单")[0]
     assert f.name == "2026-10-21.md" and "标题 bili:BV2" in missed and "重复热点 2 条" in text
+
+
+# ---- final review fixes ----
+
+def test_i1_xhs_tools_unavailable_does_not_crash_deep_read(env_full):
+    from attention_budget.models import SourceFailure
+
+    def broken_tools():
+        raise SourceFailure("xhs", "xiaohongshu-mcp 没起来")
+
+    env_full.xhs.tools = broken_tools
+    r = env_full.run()
+    assert r.status in ("ok", "partial") and r.stats["deep_read"] == 5
+
+
+def test_i3_one_failing_xhs_job_does_not_fail_the_source(env_full):
+    from attention_budget.models import SourceFailure
+    orig = env_full.xhs.key_creators_updates
+
+    def boom(links, n):
+        raise SourceFailure("xhs", "/api/v1/user/profile 返回 0 条")
+
+    env_full.xhs.key_creators_updates = boom
+    r = env_full.run()
+    assert "xhs" not in r.source_status and r.status == "ok"
+    assert "xhs:a" in env_full.xhs.remembered and "xhs:b" in env_full.xhs.remembered
+    assert "user/profile" in str(r.extra.get("warnings"))
+
+
+def test_i9_followed_author_cannot_be_serendipity(env_full):
+    # bili:BV2 comes via recommend but its author is one we follow (author of the follow item)
+    env_full.bili.script["follow_updates"] = [make_item("bili:BV1", "follow", author_id="up1")]
+    env_full.bili.script["recommend"] = [make_item("bili:BV2", "recommend", author_id="up1")]
+    env_full.llm.script["FinalResult"] = [{"picks": [{"id": "bili:BV2", "rank": 1}],
+                                           "serendipity": {"id": "bili:BV2", "reason": "x"}, "reject_summary": []}]
+    r = env_full.run()
+    assert [(p.item_id, p.serendipity) for _, p, _ in r.picks] == [("bili:BV2", False)]
+
+
+def test_i2_result_can_be_rebuilt_for_resend(env_full):
+    from attention_budget.pipeline import rebuild_result
+    r = env_full.run()
+    again = rebuild_result(env_full.cfg, env_full.ledger, r.run_id)
+    assert [p.item_id for _, p, _ in again.picks] == [p.item_id for _, p, _ in r.picks]
+    assert again.stats["seen"] == r.stats["seen"]
+
+
+def test_xhs_process_down_stand_in_keeps_bili_running(env_full):
+    from attention_budget.cli import FailedXhs
+    from attention_budget.models import SourceFailure
+    env_full.xhs = FailedXhs(SourceFailure("xhs", "xiaohongshu-mcp 没起来"))
+    r = env_full.run()
+    assert r.status == "partial" and "没起来" in r.source_status["xhs"]

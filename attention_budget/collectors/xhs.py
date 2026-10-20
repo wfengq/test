@@ -2,6 +2,7 @@
 import base64
 import random
 import re
+import os
 import secrets
 import subprocess
 import sys
@@ -50,25 +51,43 @@ class XhsProcess:
         if not self.exe_path or not Path(self.exe_path).exists():
             raise SourceFailure("xhs", "没找到 xiaohongshu-mcp，请在 config.toml 里填 xhs.exe_path")
         self.token = secrets.token_urlsafe(24)
-        args = [str(self.exe_path), "-headless=true", f"-port=:{self.port}", f"-token={self.token}"]
+        # bind to localhost only; pass the token through the environment so it is not on the command line
+        args = [str(self.exe_path), "-headless=true", f"-port=127.0.0.1:{self.port}"]
         try:
             self.proc = self.popen(args, cwd=str(Path(self.exe_path).parent), stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
+                                   stderr=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW,
+                                   env={**os.environ, "AUTH_TOKEN": self.token})
         except OSError as e:
             raise SourceFailure("xhs", f"xiaohongshu-mcp 没起来：{e}") from e
         deadline = self.clock() + HEALTH_TIMEOUT
         last = "无响应"
         while self.clock() < deadline:
+            if self.proc.poll() is not None:
+                self._stop()
+                raise SourceFailure("xhs", "xiaohongshu-mcp 启动后马上退出了（可能端口 "
+                                           f"{self.port} 被占用，或程序文件损坏）")
             try:
                 if self.http.get(f"{self.base_url}/health", timeout=2).status_code == 200:
+                    self._confirm_ours()
                     return self
                 last = "健康检查返回异常"
+            except SourceFailure:
+                raise
             except Exception as e:
                 last = str(e)
             self.sleep(1)
         self._stop()
         raise SourceFailure("xhs", f"xiaohongshu-mcp 没起来：30 秒内健康检查不通过（{last}；"
                                    "可能是端口被占用，或首次运行还在下载浏览器）")
+
+    def _confirm_ours(self) -> None:
+        """/health is unauthenticated; make sure the server answering is the one we just started."""
+        r = self.http.get(f"{self.base_url}/api/v1/login/status", timeout=60,
+                          headers={"Authorization": f"Bearer {self.token}"})
+        if r.status_code == 401:
+            self._stop()
+            raise SourceFailure("xhs", f"端口 {self.port} 被别的程序占用（可能是上次没关掉的 xiaohongshu-mcp，"
+                                       "重启电脑或在任务管理器里结束它即可）")
 
     def _stop(self) -> None:
         if self.proc is not None:
@@ -141,6 +160,7 @@ class XhsCollector:
         self._tokens: dict[str, str] = {}
         self._details = 0
         self._logged_in: bool | None = None
+        self.warnings: list[str] = []
 
     # ---- transport ----
     def _request(self, method: str, path: str, json: dict | None = None) -> dict:
@@ -170,8 +190,8 @@ class XhsCollector:
         if self._logged_in is None:
             try:
                 self._logged_in = bool(self._request("GET", "/api/v1/login/status")["data"].get("is_logged_in"))
-            except XhsApiError:
-                self._logged_in = False
+            except XhsApiError as e:
+                raise SourceFailure("xhs", f"xiaohongshu-mcp 出错：{e}") from e
         return self._logged_in
 
     def login_qr(self) -> bytes:
@@ -202,11 +222,18 @@ class XhsCollector:
                              query, limit)
 
     def key_creators_updates(self, links: list[str], per_creator: int) -> list[Item]:
+        """Each creator is isolated: a bad link or an empty page skips that creator only."""
         out = []
         for link in links:
-            user_id, token = parse_profile_link(link)
-            out += self._collect("POST", "/api/v1/user/profile",
-                                 {"user_id": user_id, "xsec_token": token, "tab": "note"}, "follow", None, per_creator)
+            try:
+                user_id, token = parse_profile_link(link)
+                out += self._collect("POST", "/api/v1/user/profile",
+                                     {"user_id": user_id, "xsec_token": token, "tab": "note"}, "follow", None,
+                                     per_creator)
+            except (ValueError, SourceFailure) as e:
+                self.warnings.append(f"重点博主 {link[:60]}：{e}")
+                if isinstance(e, SourceFailure) and e.reason.startswith("xiaohongshu-mcp 出错"):
+                    raise
         return out
 
     def remember(self, items: list[Item]) -> None:

@@ -1,4 +1,5 @@
 """One daily round: collect → search → coarse → deep → final, resumable at every step."""
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -38,34 +39,34 @@ def _bound_tools(item: Item, bili, xhs) -> dict:
         bvid = item.id.split(":", 1)[1]
         return {"subtitle": lambda: t["subtitle"](bvid), "comments": lambda: t["comments"](bvid),
                 "up_recent": lambda: t["up_recent"](item.author_id)}
-    t = xhs.tools()
+    try:
+        t = xhs.tools()
+    except SourceFailure as e:
+        msg = f"工具失败：小红书暂时不可用（{e.reason}），请根据已有信息下结论"
+        return {"note_detail": lambda: msg, "author_recent": lambda: msg}
     return {"note_detail": lambda: t["note_detail"](item.id),
             "author_recent": lambda: t["author_recent"](item.author_id, item.xsec_token or "")}
 
 
-def _collect(cfg, ledger: Ledger, run_id: str, bili, xhs, now: datetime, status: dict) -> None:
+def _collect(cfg, ledger: Ledger, run_id: str, bili, xhs, now: datetime, errors: dict) -> None:
     since = ledger.last_run_started_at() or (now - timedelta(hours=24))
     v = cfg.volumes
-    jobs = [("bili", lambda: bili.follow_updates(since, v.bili_follow)),
-            ("bili", lambda: bili.recommend(v.bili_recommend)),
-            ("xhs", lambda: xhs.recommend(v.xhs_recommend))]
+    jobs = [("bili", "关注更新", lambda: bili.follow_updates(since, v.bili_follow)),
+            ("bili", "首页推荐", lambda: bili.recommend(v.bili_recommend)),
+            ("xhs", "首页推荐", lambda: xhs.recommend(v.xhs_recommend))]
     if cfg.xhs.key_creators:
-        jobs.append(("xhs", lambda: xhs.key_creators_updates(cfg.xhs.key_creators, v.xhs_creator_notes)))
-    for src, job in jobs:
-        if src in status:
-            continue
+        jobs.append(("xhs", "重点博主", lambda: xhs.key_creators_updates(cfg.xhs.key_creators, v.xhs_creator_notes)))
+    for src, name, job in jobs:
         try:
             ledger.save_items(run_id, job())
-        except SourceFailure as e:
-            status[src] = e.reason
+        except SourceFailure as e:  # one interface failing does not fail the source (spec §7)
+            errors.setdefault(src, []).append(f"{name}：{e.reason}")
+    for w in getattr(xhs, "warnings", []) or []:
+        errors.setdefault("xhs", []).append(w)
 
 
-def _search(cfg, ledger: Ledger, llm, guard: Guard, run_id: str, bili, xhs, ctx: str, status: dict) -> None:
-    if len(status) == 2:
-        return
+def _search(cfg, ledger: Ledger, llm, guard: Guard, run_id: str, bili, xhs, ctx: str, errors: dict) -> None:
     for q in plan_searches(llm, guard, ctx, cfg):
-        if q["platform"] in status:
-            continue
         try:
             if q["platform"] == "bili":
                 found = bili.search(q["query"], cfg.volumes.results_per_search)
@@ -75,7 +76,21 @@ def _search(cfg, ledger: Ledger, llm, guard: Guard, run_id: str, bili, xhs, ctx:
             ledger.add_tool_call(run_id, None, "search", q, True)
         except SourceFailure as e:
             ledger.add_tool_call(run_id, None, "search", q, False, e.reason)
+            errors.setdefault(q["platform"], []).append(f"搜索「{q['query']}」：{e.reason}")
 
+
+def _source_status(items: dict, errors: dict) -> dict[str, str]:
+    """A source counts as failed only when it produced nothing at all this round."""
+    produced = {it.platform for it in items.values()}
+    return {src: msgs[0].split("：", 1)[-1] for src, msgs in errors.items() if msgs and src not in produced}
+
+
+def _followed_authors(cfg, ledger: Ledger) -> set[str]:
+    ids = ledger.followed_authors()
+    for link in cfg.xhs.key_creators:
+        if m := re.search(r"/user/profile/([^/?#]+)", link):
+            ids.add(m.group(1))
+    return ids
 
 
 def run_daily(cfg, ledger: Ledger, llm, bili, xhs, now: datetime, force: bool = False,
@@ -85,68 +100,74 @@ def run_daily(cfg, ledger: Ledger, llm, bili, xhs, now: datetime, force: bool = 
     t_in, t_out, calls = ledger.usage(run_id)  # resumed rounds keep counting from where they stopped
     guard.tokens, guard.tool_calls = t_in + t_out, calls
     ctx = build_context(profile_dir or (cfg.data_dir / "profile"), ledger, now, cfg)
-    status: dict = ledger.get_state(run_id, "source_status", {})
+    errors: dict = ledger.get_state(run_id, "errors", {})
     capped = bool(ledger.get_state(run_id, "capped", False))
 
     if not _done(ledger, run_id, "collect"):
-        _collect(cfg, ledger, run_id, bili, xhs, now, status)
-        ledger.set_state(run_id, "source_status", status)
+        _collect(cfg, ledger, run_id, bili, xhs, now, errors)
+        ledger.set_state(run_id, "errors", errors)
         ledger.set_stage(run_id, "collect")
     if not _done(ledger, run_id, "search"):
-        _search(cfg, ledger, llm, guard, run_id, bili, xhs, ctx, status)
+        _search(cfg, ledger, llm, guard, run_id, bili, xhs, ctx, errors)
+        ledger.set_state(run_id, "errors", errors)
         ledger.set_stage(run_id, "search")
     items = {it.id: it for it in ledger.run_items(run_id)}
     xhs_items = [it for it in items.values() if it.platform == "xhs"]
-    if xhs_items and "xhs" not in status:
+    if xhs_items:
         xhs.remember(xhs_items)
 
-    if not items:
-        status_word = "failed"
-        result = RunResult(run_id, [], [], {"seen": 0, "deep_read": 0, "reject_summary": [], "tokens_in": t_in,
-                                            "tokens_out": t_out, "cost": 0.0}, status, capped, status_word,
-                           day=now.date().isoformat())
-        ledger.finish_run(run_id, status_word, status, capped)
-        ledger.set_stage(run_id, "done")
-        return result
+    if items:
+        if not _done(ledger, run_id, "coarse"):
+            shortlist = coarse_rank(llm, guard, ledger, run_id, list(items.values()), ctx, cfg)
+            ledger.set_state(run_id, "shortlist", shortlist)
+            ledger.set_stage(run_id, "coarse")
+        if not _done(ledger, run_id, "deep"):
+            read = {v["item_id"] for v in ledger.verdicts(run_id, "deep")}
+            for item_id in ledger.get_state(run_id, "shortlist", []):
+                if item_id in read or item_id not in items:
+                    continue
+                if guard.exhausted:
+                    capped = True
+                    break
+                try:
+                    deep_read(llm, guard, ledger, run_id, items[item_id], _bound_tools(items[item_id], bili, xhs), ctx)
+                except CapReached:
+                    capped = True
+                    break
+            ledger.set_state(run_id, "capped", capped)
+            ledger.set_stage(run_id, "deep")
+        if not _done(ledger, run_id, "final"):
+            picks, summary = finalize(llm, guard, ledger, run_id, ctx, cfg.budget,
+                                      followed=_followed_authors(cfg, ledger))
+            ledger.set_state(run_id, "final", [p.__dict__ for p in picks])
+            ledger.set_state(run_id, "reject_summary", summary)
+            ledger.set_stage(run_id, "final")
 
-    if not _done(ledger, run_id, "coarse"):
-        shortlist = coarse_rank(llm, guard, ledger, run_id, list(items.values()), ctx, cfg)
-        ledger.set_state(run_id, "shortlist", shortlist)
-        ledger.set_stage(run_id, "coarse")
-    if not _done(ledger, run_id, "deep"):
-        read = {v["item_id"] for v in ledger.verdicts(run_id, "deep")}
-        for item_id in ledger.get_state(run_id, "shortlist", []):
-            if item_id in read or item_id not in items:
-                continue
-            if guard.exhausted:
-                capped = True
-                break
-            try:
-                deep_read(llm, guard, ledger, run_id, items[item_id], _bound_tools(items[item_id], bili, xhs), ctx)
-            except CapReached:
-                capped = True
-                break
-        ledger.set_state(run_id, "capped", capped)
-        ledger.set_stage(run_id, "deep")
-    if not _done(ledger, run_id, "final"):
-        picks, summary = finalize(llm, guard, ledger, run_id, ctx, cfg.budget)
-        ledger.set_state(run_id, "final", [p.__dict__ for p in picks])
-        ledger.set_state(run_id, "reject_summary", summary)
-        ledger.set_stage(run_id, "final")
+    result = rebuild_result(cfg, ledger, run_id)
+    ledger.finish_run(run_id, result.status, result.source_status, result.capped)
+    ledger.set_stage(run_id, "done")
+    return result
 
+
+def rebuild_result(cfg, ledger: Ledger, run_id: str) -> RunResult:
+    """Everything needed to (re)send a round, read back from the ledger."""
+    items = {it.id: it for it in ledger.run_items(run_id)}
+    errors = ledger.get_state(run_id, "errors", {})
+    status = _source_status(items, errors)
     picks = [FinalPick(**d) for d in ledger.get_state(run_id, "final", [])]
     deep = {v["item_id"]: v for v in ledger.verdicts(run_id, "deep")}
     picked = {p.item_id for p in picks}
-    result_picks = [(items[p.item_id], p, deep[p.item_id]) for p in picks if p.item_id in items]
-    missed = [(items[k], v) for k, v in deep.items() if v["decision"] in ("pick", "maybe") and k not in picked]
+    result_picks = [(items[p.item_id], p, deep[p.item_id]) for p in picks if p.item_id in items and p.item_id in deep]
+    missed = [(items[k], v) for k, v in deep.items() if v["decision"] in ("pick", "maybe") and k not in picked
+              and k in items]
     t_in, t_out, _ = ledger.usage(run_id)
     cost = t_in / 1e6 * cfg.deepseek.price_in_per_m + t_out / 1e6 * cfg.deepseek.price_out_per_m
     stats = {"seen": len(items), "deep_read": len(deep), "reject_summary": ledger.get_state(run_id, "reject_summary", []),
              "tokens_in": t_in, "tokens_out": t_out, "cost": round(cost, 4)}
-    status_word = "failed" if len(status) == 2 else ("partial" if status else "ok")
-    ledger.finish_run(run_id, status_word, status, capped)
-    ledger.set_stage(run_id, "done")
-    return RunResult(run_id, result_picks, missed, stats, status, capped, status_word, day=now.date().isoformat())
+    status_word = "failed" if not items else ("partial" if status else "ok")
+    warnings = [w for msgs in errors.values() for w in msgs]
+    return RunResult(run_id, result_picks, missed, stats, status, bool(ledger.get_state(run_id, "capped", False)),
+                     status_word, day=ledger.run_day(run_id), extra={"warnings": warnings})
 
 
 def write_report(result: RunResult, reports_dir: Path) -> Path:

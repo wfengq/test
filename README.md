@@ -49,7 +49,7 @@
 ## 验证（只能在你自己的电脑上做）
 
 1. `uv run attention-budget check-sources` —— 各来源各拉一次，打印条数；B 站三类、小红书三到四类都应 > 0 条。不调 AI、不推送。
-2. `uv run attention-budget run --dry-run` —— 真跑一轮，结果打印在终端，不发 Telegram；`%USERPROFILE%\.attention-budget\reports\` 下会有当天的报告。
+2. `uv run attention-budget run --dry-run` —— 真跑一轮，结果打印在终端，不发 Telegram；报告写在 `reports-dryrun\`。试跑用的是单独的账本，**不会占掉当天的正式推送**。
 
 ## 让它每天自动跑
 
@@ -60,6 +60,8 @@
 | `attention-budget-daily` | 每天 08:00（电脑没开就开机后补跑一次） | 跑一轮并推送 |
 | `attention-budget-review` | 每周日 20:00 | 推送本周复盘，逐条「采纳 / 不采纳」 |
 | `attention-budget-bot` | 登录 Windows 时 | 常驻接收你的按钮和留言 |
+
+如果提示"拒绝访问"，用管理员身份打开 PowerShell 再运行一次。运行日志在 `%USERPROFILE%\.attention-budget\logs\`。
 
 不想要了：`uv run attention-budget uninstall-tasks`。
 

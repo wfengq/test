@@ -16,6 +16,9 @@ dependencies = [
 [project.scripts]
 attention-budget = "attention_budget.cli:main"
 
+[project.gui-scripts]
+attention-budget-bg = "attention_budget.cli:main"
+
 [dependency-groups]
 dev = ["pytest", "pillow"]
 

@@ -116,13 +116,16 @@ def deep_read(llm: LLM, guard: Guard, ledger: Ledger, run_id: str, item: Item,
     return verdict
 
 
-def finalize(llm: LLM, guard: Guard, ledger: Ledger, run_id: str, ctx: str, budget) -> tuple[list[FinalPick], list[dict]]:
+def finalize(llm: LLM, guard: Guard, ledger: Ledger, run_id: str, ctx: str, budget,
+             followed: set[str] = frozenset()) -> tuple[list[FinalPick], list[dict]]:
     items = {it.id: it for it in ledger.run_items(run_id)}
     deep = {v["item_id"]: v for v in ledger.verdicts(run_id, "deep") if v["decision"] in ("pick", "maybe")}
     deep = {k: v for k, v in deep.items() if k in items}
     if not deep:
         return [], []
-    channel_of = {k: items[k].channel for k in deep}
+    # serendipity means "not from someone he follows": a followed author's item counts as follow whatever the channel
+    channel_of = {k: "follow" if items[k].author_id and items[k].author_id in followed else items[k].channel
+                  for k in deep}
     pushed = ledger.pushed_ids()
     lines = "\n".join(f"{k} | {PLATFORM_TEXT[items[k].platform]} | {CHANNEL_TEXT[items[k].channel]} | "
                       f"{items[k].title} | {v['decision']} | {v['note_to_user']}" for k, v in deep.items())

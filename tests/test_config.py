@@ -30,3 +30,11 @@ def test_more_than_ten_key_creators_rejected(tmp_path):
                  f'[telegram]\nbot_token="t"\nchat_id=42\n[xhs]\nkey_creators=[{links}]\n', encoding="utf-8")
     with pytest.raises(ValueError, match="key_creators"):
         load_config(p)
+
+
+def test_i3_malformed_key_creator_link_rejected_at_load(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text('[deepseek]\napi_key="k"\n[telegram]\nbot_token="t"\nchat_id=42\n'
+                 '[xhs]\nkey_creators=["https://www.xiaohongshu.com/user/profile/abc"]\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="xsec_token"):
+        load_config(p)

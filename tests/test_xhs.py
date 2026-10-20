@@ -174,7 +174,7 @@ class NeverHealthy:
 
 class Healthy:
     @staticmethod
-    def get(url, timeout=None):
+    def get(url, timeout=None, headers=None):
         return httpx.Response(200, json={"status": "ok"})
 
 
@@ -202,8 +202,8 @@ def test_process_starts_headless_with_random_token_and_stops(tmp_path):
     exe.write_bytes(b"")
     popen = FakePopen()
     with XhsProcess(exe, 18060, popen=popen, http=Healthy(), clock=FakeClock(step=1), sleep=lambda s: None) as p:
-        assert "-headless=true" in popen.args and "-port=:18060" in popen.args
-        assert f"-token={p.token}" in popen.args and len(p.token) >= 24
+        assert "-headless=true" in popen.args and "-port=127.0.0.1:18060" in popen.args
+        assert len(p.token) >= 24
     assert popen.last.killed
 
 
@@ -211,3 +211,68 @@ def test_missing_exe_is_source_failure(tmp_path):
     with pytest.raises(SourceFailure, match="exe_path"):
         with XhsProcess(None, 18060):
             pass
+
+
+# ---- final review fixes ----
+
+def test_i3_key_creator_failures_are_isolated(mock_xhs):
+    xc = mock_xhs.collector()
+    good = "https://www.xiaohongshu.com/user/profile/kc1?xsec_token=ptok"
+    items = xc.key_creators_updates(["https://www.xiaohongshu.com/user/profile/bad", good], 10)
+    assert [i.id for i in items] == ["xhs:64f0000000000000000000c1"]
+
+
+def test_i4_api_error_on_login_check_is_not_reported_as_logged_out():
+    m = MockXhs()
+    orig = m.handler
+    m.handler = lambda r: (httpx.Response(401, json={"success": False, "error": "unauthorized"})
+                           if r.url.path == "/api/v1/login/status" else orig(r))
+    with pytest.raises(SourceFailure) as e:
+        m.collector().recommend(50)
+    assert "未登录" not in e.value.reason and "401" in e.value.reason
+
+
+class DiesImmediately(FakeProc):
+    def poll(self):
+        return 1
+
+
+def test_i4_process_that_exits_is_detected(tmp_path):
+    exe = tmp_path / "x.exe"
+    exe.write_bytes(b"")
+    popen = FakePopen()
+    popen_fn = lambda args, **kw: (setattr(popen, "last", DiesImmediately()), setattr(popen, "kw", kw), popen.last)[2]
+    with pytest.raises(SourceFailure, match="退出"):
+        with XhsProcess(exe, 18060, popen=popen_fn, http=Healthy(), clock=FakeClock(step=1), sleep=lambda s: None):
+            pass
+
+
+class AuthRejects:
+    @staticmethod
+    def get(url, timeout=None, headers=None):
+        if url.endswith("/health"):
+            return httpx.Response(200, json={})
+        return httpx.Response(401, json={"success": False})
+
+
+def test_i4_foreign_server_on_port_is_detected(tmp_path):
+    exe = tmp_path / "x.exe"
+    exe.write_bytes(b"")
+    with pytest.raises(SourceFailure, match="端口"):
+        with XhsProcess(exe, 18060, popen=FakePopen(), http=AuthRejects(), clock=FakeClock(step=1),
+                        sleep=lambda s: None):
+            pass
+
+
+def test_i4_binds_localhost_and_passes_token_by_env(tmp_path):
+    exe = tmp_path / "x.exe"
+    exe.write_bytes(b"")
+    seen = {}
+
+    def popen(args, **kw):
+        seen["args"], seen["env"] = args, kw.get("env") or {}
+        return FakeProc()
+
+    with XhsProcess(exe, 18060, popen=popen, http=Healthy(), clock=FakeClock(step=1), sleep=lambda s: None) as p:
+        assert "-port=127.0.0.1:18060" in seen["args"]
+        assert not any("token" in a for a in seen["args"]) and seen["env"]["AUTH_TOKEN"] == p.token
