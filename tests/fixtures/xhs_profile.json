@@ -1,0 +1,4 @@
+{"success": true, "message": "ok", "data": {"data": {"userBasicInfo": {"nickname": "重点博主"}, "interactions": [], "feeds": [
+ {"id": "64f0000000000000000000c1", "xsecToken": "tokc", "modelType": "note", "index": 0,
+  "noteCard": {"type": "normal", "displayTitle": "新笔记", "user": {"userId": "kc1", "nickname": "重点博主"}, "interactInfo": {"likedCount": "5"}}}
+]}}}

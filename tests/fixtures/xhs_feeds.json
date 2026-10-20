@@ -1,0 +1,9 @@
+{"success": true, "message": "ok", "data": {"count": 4, "feeds": [
+ {"id": "64f0000000000000000000a1", "xsecToken": "tok1", "modelType": "note", "index": 0,
+  "noteCard": {"type": "normal", "displayTitle": "Agent 记忆的三种做法", "user": {"userId": "u1", "nickname": "博主甲"}, "interactInfo": {"likedCount": "1.2万"}}},
+ {"id": "64f0000000000000000000a2", "xsecToken": "tok2", "modelType": "note", "index": 1,
+  "noteCard": {"type": "video", "displayTitle": "注意力管理实操", "user": {"userId": "u2", "nickName": "博主乙"}, "interactInfo": {"likedCount": "356"}}},
+ {"id": "live1", "xsecToken": "", "modelType": "live_v2", "index": 2, "noteCard": {"type": "", "displayTitle": "", "user": {}, "interactInfo": {}}},
+ {"id": "64f0000000000000000000a3", "xsecToken": "tok3", "modelType": "note", "index": 3,
+  "noteCard": {"type": "normal", "displayTitle": "周末去哪", "user": {"userId": "u3", "nickname": "博主丙"}, "interactInfo": {"likedCount": "10"}}}
+]}}

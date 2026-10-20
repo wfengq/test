@@ -1,0 +1,4 @@
+{"success": true, "message": "ok", "data": {"count": 1, "feeds": [
+ {"id": "64f0000000000000000000b1", "xsecToken": "tokb", "modelType": "note", "index": 0,
+  "noteCard": {"type": "normal", "displayTitle": "记忆系统踩坑", "user": {"userId": "u9", "nickname": "我关注的人"}, "interactInfo": {"likedCount": "88"}}}
+]}}
