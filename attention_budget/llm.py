@@ -23,6 +23,10 @@ class LLMError(Exception):
     pass
 
 
+class LLMFormatError(LLMError):
+    """The model answered, but twice not in the required shape."""
+
+
 class LLM(Protocol):
     def complete_json(self, messages: list[dict], schema: type[T]) -> tuple[T, Usage]: ...
 
@@ -59,7 +63,7 @@ class DeepSeekLLM:
                 return schema.model_validate(json.loads(text)), usage
             except (json.JSONDecodeError, ValidationError) as e:
                 if attempt == 1:
-                    raise LLMError(f"DeepSeek 两次输出都不符合格式：{e}") from e
+                    raise LLMFormatError(f"DeepSeek 两次输出都不符合格式：{e}") from e
                 messages += [{"role": "assistant", "content": text},
                              {"role": "user", "content": f"上次输出不符合格式：{e}，请只输出符合要求的 JSON"}]
         raise AssertionError("unreachable")
